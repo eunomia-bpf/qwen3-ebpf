@@ -51,10 +51,12 @@ int qwen3_rms_finalize(struct __sk_buff *skb)
     __u64 root;
 
     (void)skb;
-    if (!work || work->completed_tiles != QWEN3_HIDDEN_TILES)
+    if (!work || !work->total_tiles || work->total_tiles > QWEN3_HIDDEN_TILES ||
+        work->completed_tiles != work->total_tiles)
         return 0;
     /* eps=1e-6, expressed in Q32 as 4295. */
-    root = isqrt64(work->sum_sq_q32 / QWEN3_HIDDEN_SIZE + 4295);
+    root = isqrt64(work->sum_sq_q32 /
+                   (work->total_tiles * QWEN3_TILE_WIDTH) + 4295);
     work->inv_rms_q16 = (1ULL << 32) / root;
     return 0;
 }
@@ -67,7 +69,8 @@ int qwen3_rms_apply(struct __sk_buff *skb)
     int i;
 
     (void)skb;
-    if (!work || work->completed_tiles != QWEN3_HIDDEN_TILES ||
+    if (!work || !work->total_tiles ||
+        work->completed_tiles != work->total_tiles ||
         !work->inv_rms_q16)
         return 0;
 #pragma clang loop unroll(disable)

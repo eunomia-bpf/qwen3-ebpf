@@ -164,6 +164,8 @@ static int kernel_norm(struct qwen3_engine *engine, const char *name,
     const uint32_t key = 0;
     int tile, i;
 
+    work.total_tiles = QWEN3_HIDDEN_TILES;
+
     {
         uint64_t first_byte, elements;
         if (safetensors_find_bf16(&engine->model, name,

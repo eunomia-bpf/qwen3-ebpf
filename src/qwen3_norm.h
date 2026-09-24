@@ -11,6 +11,7 @@ struct qwen3_norm_state {
     __u64 sum_sq_q32;
     __u64 inv_rms_q16;
     __u32 completed_tiles;
+    __u32 total_tiles;
 };
 
 #endif

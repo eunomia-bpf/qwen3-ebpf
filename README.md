@@ -31,6 +31,10 @@ above Q24's representable range.
 eBPF, without a user-space lookup or per-input host computation.
 `src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
 and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
+`src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
+`src/qwen3_attention.bpf.c` computes Q·K scores plus a stable two-entry
+softmax/V reduction. Both are verified as operators but are not yet connected
+to the 28-layer driver.
 `src/one-token.c` composes these operators with all model tensors. For a
 one-token context, attention softmax has exactly one entry and is exactly 1;
 Q/K projection, QK normalization, and RoPE do not affect the attention result.
@@ -94,6 +98,10 @@ is a one-vector operator test, not a complete-layer accuracy guarantee.
 The SiLU check passed with maximum absolute error `0.000634` across 1,024
 inputs in `[-8, 8]` against a C floating-point reference. The one-token
 driver now combines it with the MLP gate and up projections.
+The 128-wide Q/K RMSNorm check passed with maximum absolute error `0.000597`;
+RoPE's test at positions 0, 1, 7, and 63 had maximum error `1.56e-05`.
+Two-token attention's synthetic one-head test had maximum error `0.000426`.
+These operator checks do not establish end-to-end two-token correctness.
 
 The full layer-0 V-projection matrix (1,024 rows, 1,048,576 MACs) then ran
 through the BPF matvec with official weights and deterministic activations.

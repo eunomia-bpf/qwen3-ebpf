@@ -180,9 +180,11 @@ weights, if obtained separately, retain their own Apache-2.0 license.
 ## Related work and novelty boundary
 
 CPU-only C Qwen3 implementations already exist, as do CUDA Qwen3-0.6B
-implementations. KernelX puts an eBPF signal path in front of a user-space
-LLM, while published eBPF work has run much smaller neural networks in the
-kernel. As of September 2026, our search did not find a public full
+implementations. An existing eunomia-bpf tutorial profiles a CUDA Qwen3
+engine with eBPF; its model arithmetic runs on the GPU, not in eBPF. KernelX
+puts an eBPF signal path in front of a user-space LLM, while published eBPF
+work has run much smaller neural networks in the kernel. As of September 2026,
+our search did not find a public full
 Qwen3-0.6B Linux-eBPF forward-pass implementation. That is a search result,
 not proof of absolute novelty.
 
@@ -191,5 +193,6 @@ not proof of absolute novelty.
 - [Hugging Face ByteLevel mapping source](https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/pre_tokenizers/byte_level.rs)
 - [qwen3.c, CPU-only C](https://github.com/adriancable/qwen3.c)
 - [qwen3.cu, CUDA](https://github.com/gigit0000/qwen3.cu)
+- [eunomia-bpf CUDA Qwen3 profiling tutorial](https://github.com/eunomia-bpf/bpf-developer-tutorial/blob/main/src/xpu/flamegraph/README.md)
 - [KernelX, eBPF/user-space LLM bridge](https://github.com/pie-314/KernelX)
 - [Linux BPF verifier documentation](https://docs.kernel.org/bpf/verifier.html)

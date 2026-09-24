@@ -9,8 +9,9 @@ tested dot product. No model weights are distributed here.
 
 ## Current experiment
 
-`src/qwen3_matvec.bpf.c` runs Q8×Q8 multiply-accumulate in a socket-filter
-BPF program. `src/matvec-smoke.c` invokes it with `bpf_prog_test_run_opts`,
+`src/qwen3_matvec.bpf.c` runs integer multiply-accumulate in a socket-filter
+BPF program, with Q8×Q8 and Q16-activation×Q24-weight paths.
+`src/matvec-smoke.c` invokes it with `bpf_prog_test_run_opts`,
 checks the map result after eight 128-element tiles, and compares against a C
 reference. This test establishes that the arithmetic ran in the kernel BPF VM;
 it does **not** establish that an LLM token can yet be generated.
@@ -30,19 +31,23 @@ To test against an actual Qwen3-0.6B tensor, obtain the official
 
 ```sh
 ./build/matvec-smoke build/qwen3_matvec.bpf.o /path/to/model.safetensors
+./build/matvec-smoke build/qwen3_matvec.bpf.o /path/to/model.safetensors --q24
 ```
 
 This reads the first 1,024 BF16 weights from layer 0's Q-projection matrix,
-quantizes that row to Q8 in the loader, and performs its dot product against a
-deterministic synthetic activation in eBPF. The loader's C dot product is
-used only as an independent assertion. This is still **not** a transformer
-forward pass or a generated token.
+quantizes that row to Q8 or Q24 in the loader, and performs its dot product
+against a deterministic synthetic activation in eBPF. The loader's C dot
+product is used only as an independent assertion. This is still **not** a
+transformer forward pass or a generated token.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
-returned `-1345`; the Q8-quantized official layer-0 Q-projection row returned
-`-90`. Both results matched the independent C assertions across eight BPF
-invocations. The downloaded model file's SHA-256 was
+returned `-1345`. For the official layer-0 Q-projection row, Q8 gave
+`-0.0366821289` and Q24 gave `-0.0083770752`, versus the original BF16 C
+reference `-0.00837016106`. Both integer accumulators matched independent C
+assertions across eight BPF invocations. This one-row result shows why Q8 is
+insufficient for cancellation-heavy operations; it does not bound whole-model
+error. The downloaded model file's SHA-256 was
 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`;
 it is not included in this repository.
 
@@ -51,8 +56,9 @@ it is not included in this repository.
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a
 toy transformer: 28 decoder layers, 1,024 hidden width, grouped-query
 attention, QK normalization, RoPE, RMSNorm, SiLU, KV cache, and a 151,936-token
-vocabulary. The next implementation steps are to ingest actual model tensors,
-define a quantization/error budget, add the remaining operators in eBPF, and
+vocabulary. The next implementation steps are to ingest all required model
+tensors, define a whole-model quantization/error budget, add the remaining
+operators in eBPF, and
 orchestrate bounded BPF invocations for complete token generation. Integer
 approximations of nonlinear operations and verifier/runtime limits require
 measurement. The user-space driver may load weights, tokenize, invoke BPF,

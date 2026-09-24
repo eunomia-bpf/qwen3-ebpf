@@ -22,11 +22,21 @@ int qwen3_matvec_tile(struct __sk_buff *skb)
         return 0;
 
 #pragma clang loop unroll(disable)
-    for (i = 0; i < QWEN3_TILE_WIDTH; i++)
-        sum += (__s64)work->activation[i] * (__s64)work->weight[i];
+    for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
+        __s64 activation = work->fixed_point_mode
+            ? work->activation_q16[i] : work->activation[i];
+        __s64 weight = work->fixed_point_mode == 2
+            ? work->weight_q24[i] : work->weight[i];
+        sum += activation * weight;
+    }
 
     work->accumulator += sum;
     work->completed_tiles++;
+    if (work->fixed_point_mode && work->completed_tiles == QWEN3_HIDDEN_TILES) {
+        work->output_q16 = work->fixed_point_mode == 2
+            ? work->accumulator >> 24
+            : (work->accumulator * work->weight_scale_q24) >> 24;
+    }
     return 0;
 }
 

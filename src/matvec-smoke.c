@@ -10,7 +10,8 @@
 #include "qwen3_tile.h"
 
 /* Safetensors stores BF16 values after an 8-byte little-endian header size. */
-static int load_qwen_q_proj_row(const char *path, int8_t *quantized, float *scale)
+static int load_qwen_q_proj_row(const char *path, int8_t *quantized,
+                                float *original, float *scale)
 {
     static const char key[] = "\"model.layers.0.self_attn.q_proj.weight\"";
     uint8_t length_bytes[8], row[2 * QWEN3_HIDDEN_SIZE];
@@ -47,6 +48,7 @@ static int load_qwen_q_proj_row(const char *path, int8_t *quantized, float *scal
                          ((uint32_t)row[2 * i + 1] << 8)) << 16;
         float magnitude;
         memcpy(&values[i], &bits, sizeof(bits));
+        original[i] = values[i];
         magnitude = values[i] < 0 ? -values[i] : values[i];
         if (magnitude > max_abs)
             max_abs = magnitude;
@@ -85,16 +87,20 @@ int main(int argc, char **argv)
         .repeat = 1,
     };
     int8_t model_row[QWEN3_HIDDEN_SIZE];
+    float model_original[QWEN3_HIDDEN_SIZE], original_reference = 0;
     float model_scale = 0;
     int64_t expected = 0;
     const uint32_t key = 0;
-    int prog_fd, map_fd, tile_index, i, rc = 1;
+    int prog_fd, map_fd, tile_index, i, mode, rc = 1;
 
-    if (argc != 2 && argc != 3) {
-        fprintf(stderr, "usage: %s build/qwen3_matvec.bpf.o [model.safetensors]\n", argv[0]);
+    if ((argc != 2 && argc != 3 && argc != 4) ||
+        (argc == 4 && strcmp(argv[3], "--q24") != 0)) {
+        fprintf(stderr, "usage: %s build/qwen3_matvec.bpf.o [model.safetensors [--q24]]\n", argv[0]);
         return 2;
     }
-    if (argc == 3 && load_qwen_q_proj_row(argv[2], model_row, &model_scale)) {
+    mode = argc == 4 ? 2 : (argc == 3 ? 1 : 0);
+    if (mode && load_qwen_q_proj_row(argv[2], model_row,
+                                        model_original, &model_scale)) {
         fprintf(stderr, "could not load Qwen3 layer-0 Q projection row from %s\n", argv[2]);
         return 1;
     }
@@ -115,13 +121,26 @@ int main(int argc, char **argv)
     }
     prog_fd = bpf_program__fd(prog);
     map_fd = bpf_map__fd(map);
+    if (mode) {
+        work.fixed_point_mode = mode;
+        work.weight_scale_q24 = (int32_t)(model_scale * (1 << 24) + 0.5f);
+    }
     for (tile_index = 0; tile_index < QWEN3_HIDDEN_TILES; tile_index++) {
         for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            work.activation[i] = (int8_t)((tile_index * 17 + i) % 21 - 10);
-            work.weight[i] = argc == 3
+            int8_t activation = (int8_t)((tile_index * 17 + i) % 21 - 10);
+            work.activation[i] = activation;
+            work.activation_q16[i] = (int32_t)activation * (1 << 16);
+            float raw_weight = mode
+                ? model_original[tile_index * QWEN3_TILE_WIDTH + i] : 0;
+            work.weight[i] = mode
                 ? model_row[tile_index * QWEN3_TILE_WIDTH + i]
                 : (int8_t)((tile_index * 7 + i * 3) % 19 - 9);
-            expected += (int64_t)work.activation[i] * work.weight[i];
+            work.weight_q24[i] = (int32_t)(raw_weight * (1 << 24) +
+                (raw_weight >= 0 ? 0.5f : -0.5f));
+            expected += (int64_t)(mode ? work.activation_q16[i] : activation)
+                        * (mode == 2 ? work.weight_q24[i] : work.weight[i]);
+            if (mode)
+                original_reference += activation * raw_weight;
         }
         if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY)) {
             perror("bpf_map_update_elem");
@@ -143,11 +162,19 @@ int main(int argc, char **argv)
                 (long long)expected, QWEN3_HIDDEN_TILES);
         goto done;
     }
-    printf("kernel Q8 matvec: %u MACs, sum=%lld, tiles=%u (matches C reference)%s\n",
-           QWEN3_HIDDEN_SIZE, (long long)work.accumulator, work.completed_tiles,
-           argc == 3 ? "; weights: actual Qwen3-0.6B layer-0 Q-projection row" : "");
-    if (argc == 3)
-        printf("weight Q8 scale: %.9g (BF16-to-Q8 preprocessing on host)\n", model_scale);
+    if (mode && work.output_q16 !=
+        (mode == 2 ? expected >> 24
+                   : (expected * work.weight_scale_q24) >> 24)) {
+        fprintf(stderr, "kernel fixed-point scale mismatch\n");
+        goto done;
+    }
+    printf("kernel matvec mode=%d: %u MACs, sum=%lld, tiles=%u (matches C reference)%s\n",
+           mode, QWEN3_HIDDEN_SIZE, (long long)work.accumulator,
+           work.completed_tiles, mode ? "; actual Qwen3 layer-0 Q-projection row" : "");
+    if (mode)
+        printf("output Q16: %lld (%.9g); original BF16 reference: %.9g; Q8 weight scale: %.9g\n",
+               (long long)work.output_q16, work.output_q16 / 65536.0,
+               original_reference, model_scale);
     rc = 0;
 done:
     bpf_object__close(obj);

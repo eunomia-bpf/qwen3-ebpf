@@ -21,6 +21,7 @@
 #define QWEN3_INTERMEDIATE 3072
 #define QWEN3_ATTENTION_WIDTH 2048
 #define QWEN3_VOCAB 151936
+#define QWEN3_EOS_TOKEN_ID 151645
 #define QWEN3_Q_HEADS 16
 #define QWEN3_KV_HEADS 8
 #define QWEN3_CONTEXT_LIMIT 40960
@@ -461,22 +462,24 @@ int main(int argc, char **argv)
     int32_t down[QWEN3_HIDDEN_SIZE], *logits = NULL;
     char name[128];
     struct timespec start;
-    uint32_t *token_ids = NULL, next_id;
+    uint32_t *token_ids = NULL, next_id = 0;
     unsigned long parsed_token;
     char *endptr;
     const char *dump_path = NULL;
-    int32_t best_logit;
-    int layer, position, head, token_count = 0, arg, rc = 1;
+    int32_t best_logit = 0;
+    int layer, position, head, token_count = 0, generate_count = 1;
+    int total_positions, emitted_count = 0, last_processed = -1;
+    int arg, rc = 1;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.safetensors token_id... [--dump-logits output.i32]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.safetensors token_id... [--generate count] [--dump-logits output.i32]\n", argv[0]);
         return 2;
     }
     token_ids = calloc((size_t)argc - 2, sizeof(*token_ids));
     if (!token_ids)
         return 1;
     arg = 2;
-    while (arg < argc && strcmp(argv[arg], "--dump-logits") != 0 &&
+    while (arg < argc && strncmp(argv[arg], "--", 2) != 0 &&
            token_count < QWEN3_CONTEXT_LIMIT) {
         errno = 0;
         parsed_token = strtoul(argv[arg], &endptr, 10);
@@ -489,14 +492,39 @@ int main(int argc, char **argv)
         token_ids[token_count++] = (uint32_t)parsed_token;
         arg++;
     }
-    if (!token_count || (arg < argc &&
-        (strcmp(argv[arg], "--dump-logits") != 0 || arg + 2 != argc))) {
-        fprintf(stderr, "expected token IDs and optional --dump-logits path\n");
+    if (arg < argc && strcmp(argv[arg], "--generate") == 0 && arg + 1 < argc) {
+        errno = 0;
+        parsed_token = strtoul(argv[arg + 1], &endptr, 10);
+        if (errno || endptr == argv[arg + 1] || *endptr ||
+            parsed_token < 1 || parsed_token > QWEN3_CONTEXT_LIMIT) {
+            fprintf(stderr, "generation count must be between 1 and %d\n",
+                    QWEN3_CONTEXT_LIMIT);
+            rc = 2;
+            goto done;
+        }
+        generate_count = (int)parsed_token;
+        arg += 2;
+    }
+    if (arg < argc && strcmp(argv[arg], "--dump-logits") == 0 &&
+        arg + 1 < argc) {
+        dump_path = argv[arg + 1];
+        arg += 2;
+    }
+    if (!token_count || arg != argc ||
+        generate_count > QWEN3_CONTEXT_LIMIT - token_count + 1) {
+        fprintf(stderr, "expected token IDs and options within %d positions\n",
+                QWEN3_CONTEXT_LIMIT);
         rc = 2;
         goto done;
     }
-    if (arg < argc)
-        dump_path = argv[arg + 1];
+    total_positions = token_count + generate_count - 1;
+    {
+        uint32_t *resized = realloc(token_ids,
+                                     ((size_t)total_positions + 1) * sizeof(*token_ids));
+        if (!resized)
+            goto done;
+        token_ids = resized;
+    }
     trace_enabled = getenv("QWEN3_TRACE") != NULL;
     if (open_engine(&engine, argv[1])) {
         fprintf(stderr, "could not load model or BPF operators\n");
@@ -505,7 +533,7 @@ int main(int argc, char **argv)
     logits = malloc((size_t)QWEN3_VOCAB * sizeof(*logits));
     cache = calloc(1, sizeof(*cache));
     if (cache) {
-        size_t elements = (size_t)token_count * QWEN3_LAYERS *
+        size_t elements = (size_t)total_positions * QWEN3_LAYERS *
                           QWEN3_KV_HEADS * QWEN3_TILE_WIDTH;
         cache->key = calloc(elements, sizeof(*cache->key));
         cache->value = calloc(elements, sizeof(*cache->value));
@@ -515,7 +543,7 @@ int main(int argc, char **argv)
         goto done;
     }
     clock_gettime(CLOCK_MONOTONIC, &start);
-    for (position = 0; position < token_count; position++) {
+    for (position = 0; position < total_positions; position++) {
         if (load_embedding(&engine, token_ids[position], hidden)) {
             fprintf(stderr, "could not load embedding for position %d\n", position);
             goto done;
@@ -627,21 +655,22 @@ int main(int argc, char **argv)
                           QWEN3_HIDDEN_SIZE, hidden))
             goto layer_fail;
         printf("position %d/%d layer %d/%d complete (%.3f s)\n",
-               position + 1, token_count, layer + 1, QWEN3_LAYERS,
+               position + 1, total_positions, layer + 1, QWEN3_LAYERS,
                elapsed(&start));
         fflush(stdout);
         }
-    }
-    if (kernel_norm(&engine, "model.norm.weight", hidden,
+        if (position < token_count - 1)
+            continue;
+        if (kernel_norm(&engine, "model.norm.weight", hidden,
                     QWEN3_HIDDEN_SIZE, normed) ||
-        kernel_matrix(&engine, "model.embed_tokens.weight",
+            kernel_matrix(&engine, "model.embed_tokens.weight",
                       QWEN3_VOCAB, QWEN3_HIDDEN_SIZE,
                       normed, 0, logits) ||
-        kernel_argmax(&engine, logits, &next_id, &best_logit)) {
-        fprintf(stderr, "final norm, vocabulary projection or argmax failed\n");
-        goto done;
-    }
-    if (dump_path) {
+            kernel_argmax(&engine, logits, &next_id, &best_logit)) {
+            fprintf(stderr, "final norm, vocabulary projection or argmax failed\n");
+            goto done;
+        }
+        if (dump_path) {
         FILE *dump = fopen(dump_path, "wb");
         size_t written;
         int close_rc;
@@ -655,10 +684,20 @@ int main(int argc, char **argv)
             fprintf(stderr, "could not write logit dump\n");
             goto done;
         }
+        }
+        emitted_count++;
+        last_processed = position;
+        printf("generated_token=%d token_id=%u logit_q16=%d\n",
+               emitted_count, next_id, best_logit);
+        fflush(stdout);
+        if (next_id == QWEN3_EOS_TOKEN_ID)
+            break;
+        if (position + 1 < total_positions)
+            token_ids[position + 1] = next_id;
     }
-    printf("context_length=%d last_input_token_id=%u next_token_id=%u best_logit_q16=%d elapsed=%.3f s\n",
-           token_count, token_ids[token_count - 1], next_id,
-           best_logit, elapsed(&start));
+    printf("prompt_tokens=%d generated_tokens=%d last_context_length=%d last_input_token_id=%u next_token_id=%u best_logit_q16=%d elapsed=%.3f s\n",
+           token_count, emitted_count, last_processed + 1,
+           token_ids[last_processed], next_id, best_logit, elapsed(&start));
     rc = 0;
     goto done;
 layer_fail:

@@ -3,7 +3,8 @@
 An experimental pure-C/libbpf implementation of Qwen3-0.6B forward
 computation in Linux eBPF. The current milestone runs **all 28 decoder layers
 for multi-token contexts**, projects to the full vocabulary, and produces the
-next token ID in the kernel. Its attention operator processes one historical
+next token ID in the kernel. Greedy decoding can reuse the cache to produce
+additional token IDs. Its attention operator processes one historical
 KV pair per BPF invocation, with a C-managed cache sized to the input length.
 The host loads and quantizes official BF16 weights, dispatches bounded
 BPF tiles, and reads results; model arithmetic and argmax run in eBPF. No
@@ -74,12 +75,14 @@ position limit):
 ```sh
 ./build/infer /path/to/model.safetensors 0
 ./build/infer /path/to/model.safetensors 0 1 2 3
+./build/infer /path/to/model.safetensors 0 1 --generate 2
 # Optional: write all 151,936 Q16 logits for an external comparison.
 ./build/infer /path/to/model.safetensors 0 --dump-logits logits.i32
 ```
 
-This emits a next token **ID**, not decoded text. The CLI does not tokenize
-text or generate multiple output tokens. Set `QWEN3_TRACE=1` for
+This emits generated token **IDs**, not decoded text. The CLI does not tokenize
+text. `--generate` defaults to 1 and stops early on Qwen's end-of-turn ID
+`151645`. Set `QWEN3_TRACE=1` for
 intermediate range diagnostics.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
@@ -136,14 +139,19 @@ error was `0.019` and RMSE `0.024`; the top four IDs agreed. The measured
 four-position forward pass took `29.43 s`. These checks establish a real
 multi-position path, not accuracy for all possible prompts or lengths.
 
+With input `[0, 1]` and `--generate 2`, greedy cache-reusing decoding returned
+`220, 16`. The official BF16 model agreed on both IDs; for the second output
+(context `[0, 1, 220]`), full-vocabulary MAE was `0.025` and RMSE `0.031`.
+This verifies one incremental step, not long-form generation quality.
+
 ## General-context target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a
 toy transformer: 28 decoder layers, 1,024 hidden width, grouped-query
 attention, QK normalization, RoPE, RMSNorm, SiLU, KV cache, and a 151,936-token
 vocabulary. The multi-position path uses the full model's weights and all
-28 layers. Text prompting still requires a C tokenizer/decoder, autoregressive
-generation, and broader numerical validation. The four-token result must not
+28 layers. Text prompting still requires a C tokenizer/decoder and broader
+numerical validation. The four-token result must not
 be extrapolated to arbitrary contexts. The user-space driver may load weights,
 tokenize, invoke BPF, and read output, but cannot
 substitute user-space model math for kernel forward computation.

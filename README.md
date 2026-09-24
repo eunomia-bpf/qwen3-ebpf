@@ -27,6 +27,8 @@ instruction processing budget on the test kernel. The finalized version keeps
 the RMS computation in eBPF while bounding each verification unit.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
 eBPF, without a user-space lookup or per-input host computation.
+`src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
+and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
 
 On a Linux host with clang's BPF target, libbpf development headers, make,
 and BPF loading privileges:

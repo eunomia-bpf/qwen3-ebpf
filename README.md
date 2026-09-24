@@ -3,8 +3,8 @@
 An experiment toward running the **model's forward computation inside Linux
 eBPF**, with a pure-C loader. This is not a finished Qwen3-0.6B inference
 engine. The current milestone implements and checks one genuine in-kernel
-integer dot-product and RMSNorm primitives spanning Qwen3-0.6B's 1,024-wide
-hidden vector.
+integer dot-product, RMSNorm, and SiLU primitives spanning Qwen3-0.6B's
+1,024-wide hidden vector.
 The host supplies tiles and invokes the BPF program; it does not compute the
 tested dot product. No model weights are distributed here.
 
@@ -22,6 +22,8 @@ and apply BPF programs. The split matters: a combined accumulation and
 branching integer-square-root program exceeded the verifier's one-million
 instruction processing budget on the test kernel. The finalized version keeps
 the RMS computation in eBPF while bounding each verification unit.
+`src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
+eBPF, without a user-space lookup or per-input host computation.
 
 On a Linux host with clang's BPF target, libbpf development headers, make,
 and BPF loading privileges:
@@ -65,6 +67,9 @@ The layer-0 input RMSNorm check with its actual BF16 scale weights passed on
 the same kernel, with maximum absolute error `7.4e-05` across 1,024 elements
 against a C floating-point reference for a deterministic input vector. This
 is a one-vector operator test, not a complete-layer accuracy guarantee.
+The SiLU check passed with maximum absolute error `0.000634` across 1,024
+inputs in `[-8, 8]` against a C floating-point reference. It is not yet
+combined with Qwen3's MLP gate and up projections.
 
 ## Full-model target and hard problems
 

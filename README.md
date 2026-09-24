@@ -1,14 +1,15 @@
 # Qwen3-0.6B in Linux eBPF (experimental)
 
-An experimental pure-C/libbpf implementation of Qwen3-0.6B forward
+An experimental C/libbpf implementation of Qwen3-0.6B forward
 computation in Linux eBPF. The current milestone runs **all 28 decoder layers
 for multi-token contexts**, projects to the full vocabulary, and produces the
 next token ID in the kernel. Greedy decoding can reuse the cache to produce
 additional token IDs. Its attention operator processes one historical
 KV pair per BPF invocation, with a C-managed cache sized to the input length.
 The host loads and quantizes official BF16 weights, dispatches bounded
-BPF tiles, and reads results; model arithmetic and argmax run in eBPF. No
-model weights are distributed here.
+BPF tiles, and reads results; model arithmetic and argmax run in eBPF. A C
+ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
+data are distributed here.
 
 ## Current experiment
 
@@ -42,11 +43,12 @@ the cached vectors and attention arithmetic are produced in eBPF.
 For a one-token context, attention softmax has exactly one entry and is exactly
 1. Longer contexts exercise the actual Q/K and attention path.
 
-On a Linux host with clang's BPF target, libbpf development headers, make,
-and BPF loading privileges:
+On a Linux host with clang's BPF target, libbpf, libelf, zlib, json-c, and
+Oniguruma development headers, make, and BPF loading privileges:
 
 ```sh
 make test
+make test-tokenizer TOKENIZER=/path/to/tokenizer.json
 ```
 
 The test loads an ephemeral BPF program and map; it attaches to no network
@@ -69,21 +71,26 @@ against a deterministic synthetic activation in eBPF. The loader's C dot
 product is used only as an independent assertion. This is still **not** a
 transformer forward pass by itself; the driver below performs that path.
 
-Run the complete forward path with input token IDs (up to the model's 40,960
-position limit):
+Run the complete forward path with input token IDs or text (up to the model's
+40,960 position limit):
 
 ```sh
 ./build/infer /path/to/model.safetensors 0
 ./build/infer /path/to/model.safetensors 0 1 2 3
 ./build/infer /path/to/model.safetensors 0 1 --generate 2
+./build/infer /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer.json --prompt "Hello, world!" --generate 2
 # Optional: write all 151,936 Q16 logits for an external comparison.
 ./build/infer /path/to/model.safetensors 0 --dump-logits logits.i32
 ```
 
-This emits generated token **IDs**, not decoded text. The CLI does not tokenize
-text. `--generate` defaults to 1 and stops early on Qwen's end-of-turn ID
-`151645`. Set `QWEN3_TRACE=1` for
-intermediate range diagnostics.
+The token-ID mode reports generated IDs. Text mode tokenizes the prompt in C,
+prints decoded bytes to stdout, and sends progress/ID diagnostics to stderr.
+For a chat prompt, include the Qwen3 control tokens and role delimiters in the
+text supplied to `--prompt`; the CLI does not invent a chat template.
+`--generate` defaults to 1 and stops early on Qwen's end-of-turn ID `151645`.
+Set `QWEN3_TRACE=1` for intermediate range diagnostics. The tokenizer is
+loaded from the official `tokenizer.json` at runtime; it is not vendored.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
@@ -95,6 +102,8 @@ insufficient for cancellation-heavy operations; it does not bound whole-model
 error. The downloaded model file's SHA-256 was
 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`;
 it is not included in this repository.
+The official tokenizer used for validation had SHA-256
+`aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`.
 
 The layer-0 input RMSNorm check with its actual BF16 scale weights passed on
 the same kernel, with maximum absolute error `7.4e-05` across 1,024 elements
@@ -144,14 +153,22 @@ With input `[0, 1]` and `--generate 2`, greedy cache-reusing decoding returned
 (context `[0, 1, 220]`), full-vocabulary MAE was `0.025` and RMSE `0.031`.
 This verifies one incremental step, not long-form generation quality.
 
+The C tokenizer matched the official tokenizer on English, Chinese, emoji,
+whitespace, mixed text, and chat control-token vectors, including byte-level
+decode roundtrips. The text prompt `Hello, world!` became the official IDs
+`[9707, 11, 1879, 0]` and generated ` This` (ID `1096`). The official BF16
+model agreed on that ID and all top-five IDs; full-vocabulary MAE was `0.035`
+and RMSE `0.044`. This is one text-prompt accuracy check.
+
 ## General-context target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a
 toy transformer: 28 decoder layers, 1,024 hidden width, grouped-query
 attention, QK normalization, RoPE, RMSNorm, SiLU, KV cache, and a 151,936-token
 vocabulary. The multi-position path uses the full model's weights and all
-28 layers. Text prompting still requires a C tokenizer/decoder and broader
-numerical validation. The four-token result must not
+28 layers. Remaining research includes broader numerical validation, long
+contexts, generation quality, verifier portability, and throughput. The
+four-token result must not
 be extrapolated to arbitrary contexts. The user-space driver may load weights,
 tokenize, invoke BPF, and read output, but cannot
 substitute user-space model math for kernel forward computation.
@@ -170,6 +187,8 @@ Qwen3-0.6B Linux-eBPF forward-pass implementation. That is a search result,
 not proof of absolute novelty.
 
 - [Qwen3-0.6B model and configuration](https://huggingface.co/Qwen/Qwen3-0.6B)
+- [Qwen3-0.6B tokenizer.json](https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/tokenizer.json)
+- [Hugging Face ByteLevel mapping source](https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/pre_tokenizers/byte_level.rs)
 - [qwen3.c, CPU-only C](https://github.com/adriancable/qwen3.c)
 - [qwen3.cu, CUDA](https://github.com/gigit0000/qwen3.cu)
 - [KernelX, eBPF/user-space LLM bridge](https://github.com/pie-314/KernelX)

@@ -15,6 +15,7 @@
 #include "qwen3_silu.h"
 #include "qwen3_tile.h"
 #include "qwen3_vector.h"
+#include "qwen3_tokenizer.h"
 #include "safetensors.h"
 
 #define QWEN3_LAYERS 28
@@ -453,6 +454,7 @@ int main(int argc, char **argv)
 {
     struct qwen3_engine engine = {0};
     struct qwen3_cache *cache = NULL;
+    struct qwen3_tokenizer *tokenizer = NULL;
     int32_t hidden[QWEN3_HIDDEN_SIZE], normed[QWEN3_HIDDEN_SIZE];
     int32_t query[QWEN3_ATTENTION_WIDTH], key_vectors[QWEN3_HIDDEN_SIZE];
     int32_t v[QWEN3_HIDDEN_SIZE], attended[QWEN3_ATTENTION_WIDTH];
@@ -466,31 +468,49 @@ int main(int argc, char **argv)
     unsigned long parsed_token;
     char *endptr;
     const char *dump_path = NULL;
+    FILE *report = stdout;
     int32_t best_logit = 0;
     int layer, position, head, token_count = 0, generate_count = 1;
     int total_positions, emitted_count = 0, last_processed = -1;
     int arg, rc = 1;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.safetensors token_id... [--generate count] [--dump-logits output.i32]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.safetensors token_id... [--generate count] [--dump-logits output.i32]\n"
+                        "   or: %s model.safetensors --tokenizer tokenizer.json --prompt text [--generate count] [--dump-logits output.i32]\n",
+                argv[0], argv[0]);
         return 2;
     }
-    token_ids = calloc((size_t)argc - 2, sizeof(*token_ids));
-    if (!token_ids)
-        return 1;
-    arg = 2;
-    while (arg < argc && strncmp(argv[arg], "--", 2) != 0 &&
-           token_count < QWEN3_CONTEXT_LIMIT) {
-        errno = 0;
-        parsed_token = strtoul(argv[arg], &endptr, 10);
-        if (errno || endptr == argv[arg] || *endptr ||
-            parsed_token >= QWEN3_VOCAB) {
-            fprintf(stderr, "input token ID must be below %d\n", QWEN3_VOCAB);
-            rc = 2;
+    if (argc >= 6 && strcmp(argv[2], "--tokenizer") == 0 &&
+        strcmp(argv[4], "--prompt") == 0) {
+        size_t count;
+        tokenizer = qwen3_tokenizer_open(argv[3]);
+        if (!tokenizer ||
+            qwen3_tokenizer_encode(tokenizer, argv[5], &token_ids, &count) ||
+            !count || count > QWEN3_CONTEXT_LIMIT) {
+            fprintf(stderr, "could not encode prompt within model context\n");
             goto done;
         }
-        token_ids[token_count++] = (uint32_t)parsed_token;
-        arg++;
+        token_count = (int)count;
+        report = stderr;
+        arg = 6;
+    } else {
+        token_ids = calloc((size_t)argc - 2, sizeof(*token_ids));
+        if (!token_ids)
+            return 1;
+        arg = 2;
+        while (arg < argc && strncmp(argv[arg], "--", 2) != 0 &&
+               token_count < QWEN3_CONTEXT_LIMIT) {
+            errno = 0;
+            parsed_token = strtoul(argv[arg], &endptr, 10);
+            if (errno || endptr == argv[arg] || *endptr ||
+                parsed_token >= QWEN3_VOCAB) {
+                fprintf(stderr, "input token ID must be below %d\n", QWEN3_VOCAB);
+                rc = 2;
+                goto done;
+            }
+            token_ids[token_count++] = (uint32_t)parsed_token;
+            arg++;
+        }
     }
     if (arg < argc && strcmp(argv[arg], "--generate") == 0 && arg + 1 < argc) {
         errno = 0;
@@ -654,10 +674,10 @@ int main(int argc, char **argv)
             kernel_vector(&engine, 0, hidden, down,
                           QWEN3_HIDDEN_SIZE, hidden))
             goto layer_fail;
-        printf("position %d/%d layer %d/%d complete (%.3f s)\n",
+        fprintf(report, "position %d/%d layer %d/%d complete (%.3f s)\n",
                position + 1, total_positions, layer + 1, QWEN3_LAYERS,
                elapsed(&start));
-        fflush(stdout);
+        fflush(report);
         }
         if (position < token_count - 1)
             continue;
@@ -687,15 +707,32 @@ int main(int argc, char **argv)
         }
         emitted_count++;
         last_processed = position;
-        printf("generated_token=%d token_id=%u logit_q16=%d\n",
+        fprintf(report, "generated_token=%d token_id=%u logit_q16=%d\n",
                emitted_count, next_id, best_logit);
-        fflush(stdout);
+        fflush(report);
+        if (tokenizer && next_id != QWEN3_EOS_TOKEN_ID) {
+            unsigned char *piece = NULL;
+            size_t length;
+            if (qwen3_tokenizer_decode(tokenizer, next_id, &piece, &length)) {
+                fprintf(stderr, "could not decode generated token %u\n", next_id);
+                goto done;
+            }
+            if (fwrite(piece, 1, length, stdout) != length) {
+                free(piece);
+                fprintf(stderr, "could not write decoded token\n");
+                goto done;
+            }
+            fflush(stdout);
+            free(piece);
+        }
         if (next_id == QWEN3_EOS_TOKEN_ID)
             break;
         if (position + 1 < total_positions)
             token_ids[position + 1] = next_id;
     }
-    printf("prompt_tokens=%d generated_tokens=%d last_context_length=%d last_input_token_id=%u next_token_id=%u best_logit_q16=%d elapsed=%.3f s\n",
+    if (tokenizer)
+        fputc('\n', stdout);
+    fprintf(report, "prompt_tokens=%d generated_tokens=%d last_context_length=%d last_input_token_id=%u next_token_id=%u best_logit_q16=%d elapsed=%.3f s\n",
            token_count, emitted_count, last_processed + 1,
            token_ids[last_processed], next_id, best_logit, elapsed(&start));
     rc = 0;
@@ -711,6 +748,7 @@ done:
     free(cache);
     free(token_ids);
     free(logits);
+    qwen3_tokenizer_close(tokenizer);
     close_engine(&engine);
     return rc;
 }

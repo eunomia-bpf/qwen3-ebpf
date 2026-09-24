@@ -3,7 +3,8 @@
 An experiment toward running the **model's forward computation inside Linux
 eBPF**, with a pure-C loader. This is not a finished Qwen3-0.6B inference
 engine. The current milestone implements and checks one genuine in-kernel
-integer dot-product primitive spanning Qwen3-0.6B's 1,024-wide hidden vector.
+integer dot-product and RMSNorm primitives spanning Qwen3-0.6B's 1,024-wide
+hidden vector.
 The host supplies tiles and invokes the BPF program; it does not compute the
 tested dot product. No model weights are distributed here.
 
@@ -15,6 +16,12 @@ BPF program, with Q8×Q8 and Q16-activation×Q24-weight paths.
 checks the map result after eight 128-element tiles, and compares against a C
 reference. This test establishes that the arithmetic ran in the kernel BPF VM;
 it does **not** establish that an LLM token can yet be generated.
+
+`src/qwen3_norm.bpf.c` implements RMSNorm as separate accumulate, finalize,
+and apply BPF programs. The split matters: a combined accumulation and
+branching integer-square-root program exceeded the verifier's one-million
+instruction processing budget on the test kernel. The finalized version keeps
+the RMS computation in eBPF while bounding each verification unit.
 
 On a Linux host with clang's BPF target, libbpf development headers, make,
 and BPF loading privileges:
@@ -32,6 +39,9 @@ To test against an actual Qwen3-0.6B tensor, obtain the official
 ```sh
 ./build/matvec-smoke build/qwen3_matvec.bpf.o /path/to/model.safetensors
 ./build/matvec-smoke build/qwen3_matvec.bpf.o /path/to/model.safetensors --q24
+./build/norm-smoke build/qwen3_norm.bpf.o /path/to/model.safetensors
+# or run both model-backed checks:
+make test-model MODEL=/path/to/model.safetensors
 ```
 
 This reads the first 1,024 BF16 weights from layer 0's Q-projection matrix,
@@ -50,6 +60,11 @@ insufficient for cancellation-heavy operations; it does not bound whole-model
 error. The downloaded model file's SHA-256 was
 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`;
 it is not included in this repository.
+
+The layer-0 input RMSNorm check with its actual BF16 scale weights passed on
+the same kernel, with maximum absolute error `7.4e-05` across 1,024 elements
+against a C floating-point reference for a deterministic input vector. This
+is a one-vector operator test, not a complete-layer accuracy guarantee.
 
 ## Full-model target and hard problems
 

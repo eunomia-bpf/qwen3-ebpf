@@ -4,60 +4,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "qwen3_tile.h"
+#include "safetensors.h"
 
-/* Safetensors stores BF16 values after an 8-byte little-endian header size. */
 static int load_qwen_q_proj_row(const char *path, int8_t *quantized,
                                 float *original, float *scale)
 {
-    static const char key[] = "\"model.layers.0.self_attn.q_proj.weight\"";
-    uint8_t length_bytes[8], row[2 * QWEN3_HIDDEN_SIZE];
-    uint64_t header_length = 0, start, end;
-    char *header = NULL, *field, *offsets, *cursor;
-    FILE *file = NULL;
-    float values[QWEN3_HIDDEN_SIZE], max_abs = 0;
-    int i, rc = -1;
+    float max_abs = 0;
+    int i;
 
-    file = fopen(path, "rb");
-    if (!file || fread(length_bytes, 1, sizeof(length_bytes), file) != sizeof(length_bytes))
-        goto done;
-    for (i = 0; i < 8; i++)
-        header_length |= (uint64_t)length_bytes[i] << (8 * i);
-    if (header_length == 0 || header_length > 1024 * 1024)
-        goto done;
-    header = calloc((size_t)header_length + 1, 1);
-    if (!header || fread(header, 1, (size_t)header_length, file) != header_length)
-        goto done;
-    field = strstr(header, key);
-    if (!field || !(offsets = strstr(field, "\"data_offsets\"")) ||
-        !(cursor = strchr(offsets, '[')))
-        goto done;
-    start = strtoull(cursor + 1, &cursor, 10);
-    if (!cursor || !(cursor = strchr(cursor, ',')))
-        goto done;
-    end = strtoull(cursor + 1, NULL, 10);
-    if (end < start || end - start < sizeof(row) ||
-        fseeko(file, (off_t)(8 + header_length + start), SEEK_SET) != 0 ||
-        fread(row, 1, sizeof(row), file) != sizeof(row))
-        goto done;
+    if (safetensors_read_bf16(path,
+            "model.layers.0.self_attn.q_proj.weight", 0,
+            QWEN3_HIDDEN_SIZE, original))
+        return -1;
     for (i = 0; i < QWEN3_HIDDEN_SIZE; i++) {
-        uint32_t bits = ((uint32_t)row[2 * i] |
-                         ((uint32_t)row[2 * i + 1] << 8)) << 16;
         float magnitude;
-        memcpy(&values[i], &bits, sizeof(bits));
-        original[i] = values[i];
-        magnitude = values[i] < 0 ? -values[i] : values[i];
+        magnitude = original[i] < 0 ? -original[i] : original[i];
         if (magnitude > max_abs)
             max_abs = magnitude;
     }
     if (max_abs == 0 || max_abs > 1000)
-        goto done;
+        return -1;
     *scale = max_abs / 127.0f;
     for (i = 0; i < QWEN3_HIDDEN_SIZE; i++) {
-        float value = values[i] / *scale;
+        float value = original[i] / *scale;
         int rounded = (int)(value + (value >= 0 ? 0.5f : -0.5f));
         if (rounded > 127)
             rounded = 127;
@@ -65,12 +37,7 @@ static int load_qwen_q_proj_row(const char *path, int8_t *quantized,
             rounded = -127;
         quantized[i] = (int8_t)rounded;
     }
-    rc = 0;
-done:
-    free(header);
-    if (file)
-        fclose(file);
-    return rc;
+    return 0;
 }
 
 int main(int argc, char **argv)

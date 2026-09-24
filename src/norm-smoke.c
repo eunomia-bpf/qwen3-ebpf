@@ -83,7 +83,7 @@ int main(int argc, char **argv)
             int value = (tile_index * 17 + i) % 21 - 10;
             float w = weights[index];
             work.activation_q16[i] = value * (1 << 16);
-            work.weight_q24[i] = (int32_t)(w * (1 << 24) +
+            work.weight_q20[i] = (int32_t)(w * (1 << 20) +
                 (w >= 0 ? 0.5f : -0.5f));
         }
         if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||

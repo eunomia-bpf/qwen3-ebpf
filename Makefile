@@ -5,7 +5,7 @@ ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
 
 .PHONY: all test test-model clean
 
-all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke
+all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/one-token
 
 build:
 	mkdir -p build
@@ -36,6 +36,9 @@ build/silu-smoke: src/silu-smoke.c src/qwen3_silu.h | build
 
 build/vector-smoke: src/vector-smoke.c src/qwen3_vector.h | build
 	$(CC) $(CFLAGS) -Isrc src/vector-smoke.c -o $@ -lbpf -lelf -lz
+
+build/one-token: src/one-token.c src/safetensors.c src/safetensors.h src/qwen3_tile.h src/qwen3_norm.h src/qwen3_silu.h src/qwen3_vector.h | build
+	$(CC) $(CFLAGS) -Isrc src/one-token.c src/safetensors.c -o $@ -lbpf -lelf -lz
 
 test: all
 	./build/matvec-smoke build/qwen3_matvec.bpf.o

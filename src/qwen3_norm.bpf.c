@@ -73,9 +73,10 @@ int qwen3_rms_apply(struct __sk_buff *skb)
 #pragma clang loop unroll(disable)
     for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
         __s64 normalized =
-            ((__s64)work->activation_q16[i] * work->inv_rms_q16) >> 16;
+            ((__s64)work->activation_q16[i] *
+             (__s64)work->inv_rms_q16) >> 16;
         work->output_q16[i] =
-            (__s32)((normalized * work->weight_q24[i]) >> 24);
+            (__s32)((normalized * work->weight_q20[i]) >> 20);
     }
     return 0;
 }

@@ -1,12 +1,12 @@
 # Qwen3-0.6B in Linux eBPF (experimental)
 
-An experiment toward running the **model's forward computation inside Linux
-eBPF**, with a pure-C loader. This is not a finished Qwen3-0.6B inference
-engine. The current milestone implements and checks one genuine in-kernel
-integer dot-product, RMSNorm, and SiLU primitives spanning Qwen3-0.6B's
-1,024-wide hidden vector.
-The host supplies tiles and invokes the BPF program; it does not compute the
-tested dot product. No model weights are distributed here.
+An experimental pure-C/libbpf implementation of Qwen3-0.6B forward
+computation in Linux eBPF. The current milestone runs **all 28 decoder layers
+for a one-token context**, projects to the full vocabulary, and produces the
+next token ID in the kernel. It is not yet a general multi-token inference
+engine. The host loads and quantizes official BF16 weights, dispatches bounded
+BPF tiles, and reads results; model arithmetic and argmax run in eBPF. No
+model weights are distributed here.
 
 ## Current experiment
 
@@ -14,8 +14,8 @@ tested dot product. No model weights are distributed here.
 BPF program, with Q8×Q8 and Q16-activation×Q24-weight paths.
 `src/matvec-smoke.c` invokes it with `bpf_prog_test_run_opts`,
 checks the map result after bounded 128-element tiles, and compares against a C
-reference. This test establishes that the arithmetic ran in the kernel BPF VM;
-it does **not** establish that an LLM token can yet be generated.
+reference. That operator test alone does not establish model inference; the
+separate one-token driver below connects all decoder layers.
 The same BPF program also accepts a caller-supplied tile count; `make test`
 now checks a 3,072-element path (24 tiles), matching Qwen3's MLP intermediate
 width, while model-backed Q-projection uses eight tiles.
@@ -24,11 +24,18 @@ width, while model-backed Q-projection uses eight tiles.
 and apply BPF programs. The split matters: a combined accumulation and
 branching integer-square-root program exceeded the verifier's one-million
 instruction processing budget on the test kernel. The finalized version keeps
-the RMS computation in eBPF while bounding each verification unit.
+the RMS computation in eBPF while bounding each verification unit. RMSNorm
+weights use Q20 rather than Q24 because the official model contains weights
+above Q24's representable range.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
 eBPF, without a user-space lookup or per-input host computation.
 `src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
 and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
+`src/one-token.c` composes these operators with all model tensors. For a
+one-token context, attention softmax has exactly one entry and is exactly 1;
+Q/K projection, QK normalization, and RoPE do not affect the attention result.
+The driver repeats each V head for its two Q heads before the O projection.
+This identity does not apply to multi-token contexts.
 
 On a Linux host with clang's BPF target, libbpf development headers, make,
 and BPF loading privileges:
@@ -55,7 +62,19 @@ This reads the first 1,024 BF16 weights from layer 0's Q-projection matrix,
 quantizes that row to Q8 or Q24 in the loader, and performs its dot product
 against a deterministic synthetic activation in eBPF. The loader's C dot
 product is used only as an independent assertion. This is still **not** a
-transformer forward pass or a generated token.
+transformer forward pass by itself; the driver below performs that path.
+
+Run the complete one-token-context forward path with an input token ID:
+
+```sh
+./build/one-token /path/to/model.safetensors 0
+# Optional: write all 151,936 Q16 logits for an external comparison.
+./build/one-token /path/to/model.safetensors 0 --dump-logits logits.i32
+```
+
+This emits a next token **ID**, not decoded text. The CLI does not tokenize
+text, retain a KV cache, or extend a prompt. Set `QWEN3_TRACE=1` for
+intermediate range diagnostics.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
@@ -73,8 +92,8 @@ the same kernel, with maximum absolute error `7.4e-05` across 1,024 elements
 against a C floating-point reference for a deterministic input vector. This
 is a one-vector operator test, not a complete-layer accuracy guarantee.
 The SiLU check passed with maximum absolute error `0.000634` across 1,024
-inputs in `[-8, 8]` against a C floating-point reference. It is not yet
-combined with Qwen3's MLP gate and up projections.
+inputs in `[-8, 8]` against a C floating-point reference. The one-token
+driver now combines it with the MLP gate and up projections.
 
 The full layer-0 V-projection matrix (1,024 rows, 1,048,576 MACs) then ran
 through the BPF matvec with official weights and deterministic activations.
@@ -84,20 +103,28 @@ The model file is opened once and its tensor offset resolved once for this
 matrix. This timing excludes model download, compilation, and the rest of a
 decoder layer; it is not an LLM throughput claim.
 
-## Full-model target and hard problems
+The end-to-end one-token run used the same official weights on Linux
+6.17.0 arm64. Input token IDs `0` and `1` produced IDs `9` and `14582`,
+respectively, matching Hugging Face Transformers 5.14.1 BF16 reference runs.
+Across all 151,936 logits, the kernel Q16 output versus that reference had
+mean absolute error `0.052` / `0.030` and RMSE `0.065` / `0.038` for the
+two inputs. The top three IDs agreed for both. Measured forward times were
+8.47 s and 8.57 s, excluding model download, compilation, and container
+startup. These are two-input experimental checks, not a general accuracy or
+performance guarantee.
+
+## General-context target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a
 toy transformer: 28 decoder layers, 1,024 hidden width, grouped-query
 attention, QK normalization, RoPE, RMSNorm, SiLU, KV cache, and a 151,936-token
-vocabulary. The next implementation steps are to ingest all required model
-tensors, define a whole-model quantization/error budget, add the remaining
-operators in eBPF, and
-orchestrate bounded BPF invocations for complete token generation. Integer
-approximations of nonlinear operations and verifier/runtime limits require
-measurement. The user-space driver may load weights, tokenize, invoke BPF,
-and read output, but cannot substitute user-space model math for the kernel
-forward pass. A full-model claim requires an actual generated token checked
-against a known Qwen3 reference, with kernel verifier and runtime evidence.
+vocabulary. The one-token path now uses the full model's weights and all 28
+layers. General prompt processing still requires in-kernel Q/K projection,
+QK normalization, RoPE, multi-entry softmax, causal masking, and a KV cache,
+plus a C tokenizer/decoder and broader numerical validation. The one-token
+result must not be extrapolated to those unimplemented paths. The user-space
+driver may load weights, tokenize, invoke BPF, and read output, but cannot
+substitute user-space model math for kernel forward computation.
 
 This is a research prototype. It is not intended for production kernels or
 performance-sensitive traffic. The project code is MIT licensed; Qwen model

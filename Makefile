@@ -49,8 +49,8 @@ build/rope-smoke: src/rope-smoke.c src/qwen3_rope.h | build
 build/attention-smoke: src/attention-smoke.c src/qwen3_attention.h | build
 	$(CC) $(CFLAGS) -Isrc src/attention-smoke.c -o $@ -lbpf -lelf -lz -lm
 
-build/one-token: src/one-token.c src/safetensors.c src/safetensors.h src/qwen3_tile.h src/qwen3_norm.h src/qwen3_silu.h src/qwen3_vector.h | build
-	$(CC) $(CFLAGS) -Isrc src/one-token.c src/safetensors.c -o $@ -lbpf -lelf -lz
+build/one-token: src/one-token.c src/safetensors.c src/safetensors.h src/qwen3_tile.h src/qwen3_norm.h src/qwen3_silu.h src/qwen3_vector.h src/qwen3_rope.h src/qwen3_attention.h | build
+	$(CC) $(CFLAGS) -Isrc src/one-token.c src/safetensors.c -o $@ -lbpf -lelf -lz -lm
 
 test: all
 	./build/matvec-smoke build/qwen3_matvec.bpf.o

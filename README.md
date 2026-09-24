@@ -2,8 +2,8 @@
 
 An experimental pure-C/libbpf implementation of Qwen3-0.6B forward
 computation in Linux eBPF. The current milestone runs **all 28 decoder layers
-for a one-token context**, projects to the full vocabulary, and produces the
-next token ID in the kernel. It is not yet a general multi-token inference
+for one- or two-token contexts**, projects to the full vocabulary, and produces
+the next token ID in the kernel. It is not yet a general-context inference
 engine. The host loads and quantizes official BF16 weights, dispatches bounded
 BPF tiles, and reads results; model arithmetic and argmax run in eBPF. No
 model weights are distributed here.
@@ -33,13 +33,12 @@ eBPF, without a user-space lookup or per-input host computation.
 and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
 `src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
 `src/qwen3_attention.bpf.c` computes Q·K scores plus a stable two-entry
-softmax/V reduction. Both are verified as operators but are not yet connected
-to the 28-layer driver.
-`src/one-token.c` composes these operators with all model tensors. For a
-one-token context, attention softmax has exactly one entry and is exactly 1;
-Q/K projection, QK normalization, and RoPE do not affect the attention result.
-The driver repeats each V head for its two Q heads before the O projection.
-This identity does not apply to multi-token contexts.
+softmax/V reduction. `src/one-token.c` composes these operators with all model
+tensors, including Q/K projection, QK normalization, RoPE, causal attention,
+and grouped-query head sharing. Its current C-managed KV cache holds two
+positions; the cached vectors and attention arithmetic are produced in eBPF.
+For a one-token context, attention softmax has exactly one entry and is exactly
+1. A two-token context exercises the actual Q/K and attention path.
 
 On a Linux host with clang's BPF target, libbpf development headers, make,
 and BPF loading privileges:
@@ -68,16 +67,17 @@ against a deterministic synthetic activation in eBPF. The loader's C dot
 product is used only as an independent assertion. This is still **not** a
 transformer forward pass by itself; the driver below performs that path.
 
-Run the complete one-token-context forward path with an input token ID:
+Run the complete forward path with one or two input token IDs:
 
 ```sh
 ./build/one-token /path/to/model.safetensors 0
+./build/one-token /path/to/model.safetensors 0 1
 # Optional: write all 151,936 Q16 logits for an external comparison.
 ./build/one-token /path/to/model.safetensors 0 --dump-logits logits.i32
 ```
 
 This emits a next token **ID**, not decoded text. The CLI does not tokenize
-text, retain a KV cache, or extend a prompt. Set `QWEN3_TRACE=1` for
+text or extend a prompt beyond two token IDs. Set `QWEN3_TRACE=1` for
 intermediate range diagnostics.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
@@ -101,7 +101,6 @@ driver now combines it with the MLP gate and up projections.
 The 128-wide Q/K RMSNorm check passed with maximum absolute error `0.000597`;
 RoPE's test at positions 0, 1, 7, and 63 had maximum error `1.56e-05`.
 Two-token attention's synthetic one-head test had maximum error `0.000426`.
-These operator checks do not establish end-to-end two-token correctness.
 
 The full layer-0 V-projection matrix (1,024 rows, 1,048,576 MACs) then ran
 through the BPF matvec with official weights and deterministic activations.
@@ -121,16 +120,23 @@ two inputs. The top three IDs agreed for both. Measured forward times were
 startup. These are two-input experimental checks, not a general accuracy or
 performance guarantee.
 
+The end-to-end `[0, 1]` context returned next token ID `220`, matching the
+official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean
+absolute error was `0.024` and RMSE `0.030`; the top three token IDs agreed.
+The measured two-position forward pass took `23.38 s`, excluding model
+download and compilation. This is one two-token validation input, not a
+general-context accuracy guarantee.
+
 ## General-context target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a
 toy transformer: 28 decoder layers, 1,024 hidden width, grouped-query
 attention, QK normalization, RoPE, RMSNorm, SiLU, KV cache, and a 151,936-token
-vocabulary. The one-token path now uses the full model's weights and all 28
-layers. General prompt processing still requires in-kernel Q/K projection,
-QK normalization, RoPE, multi-entry softmax, causal masking, and a KV cache,
-plus a C tokenizer/decoder and broader numerical validation. The one-token
-result must not be extrapolated to those unimplemented paths. The user-space
+vocabulary. The one- and two-token paths use the full model's weights and all
+28 layers. General prompt processing still requires attention beyond two
+entries, cache scaling, a C tokenizer/decoder, and broader numerical
+validation. The two-token result must not be extrapolated to arbitrary
+contexts. The user-space
 driver may load weights, tokenize, invoke BPF, and read output, but cannot
 substitute user-space model math for kernel forward computation.
 

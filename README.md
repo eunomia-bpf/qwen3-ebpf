@@ -25,6 +25,27 @@ make test
 The test loads an ephemeral BPF program and map; it attaches to no network
 interface and installs nothing persistently.
 
+To test against an actual Qwen3-0.6B tensor, obtain the official
+`model.safetensors` separately and run:
+
+```sh
+./build/matvec-smoke build/qwen3_matvec.bpf.o /path/to/model.safetensors
+```
+
+This reads the first 1,024 BF16 weights from layer 0's Q-projection matrix,
+quantizes that row to Q8 in the loader, and performs its dot product against a
+deterministic synthetic activation in eBPF. The loader's C dot product is
+used only as an independent assertion. This is still **not** a transformer
+forward pass or a generated token.
+
+First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
+container, BPF program accepted by the kernel verifier. The synthetic row
+returned `-1345`; the Q8-quantized official layer-0 Q-projection row returned
+`-90`. Both results matched the independent C assertions across eight BPF
+invocations. The downloaded model file's SHA-256 was
+`f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`;
+it is not included in this repository.
+
 ## Full-model target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a

@@ -88,11 +88,12 @@ int main(int argc, char **argv)
     }
     prog_fd = bpf_program__fd(prog);
     map_fd = bpf_map__fd(map);
+    work.total_tiles = mode ? QWEN3_HIDDEN_TILES : 24;
     if (mode) {
         work.fixed_point_mode = mode;
         work.weight_scale_q24 = (int32_t)(model_scale * (1 << 24) + 0.5f);
     }
-    for (tile_index = 0; tile_index < QWEN3_HIDDEN_TILES; tile_index++) {
+    for (tile_index = 0; tile_index < (int)work.total_tiles; tile_index++) {
         for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
             int8_t activation = (int8_t)((tile_index * 17 + i) % 21 - 10);
             work.activation[i] = activation;
@@ -123,10 +124,10 @@ int main(int argc, char **argv)
         }
     }
     if (work.accumulator != expected ||
-        work.completed_tiles != QWEN3_HIDDEN_TILES) {
+        work.completed_tiles != work.total_tiles) {
         fprintf(stderr, "kernel mismatch: got %lld/%u, expected %lld/%u\n",
                 (long long)work.accumulator, work.completed_tiles,
-                (long long)expected, QWEN3_HIDDEN_TILES);
+                (long long)expected, work.total_tiles);
         goto done;
     }
     if (mode && work.output_q16 !=
@@ -136,7 +137,7 @@ int main(int argc, char **argv)
         goto done;
     }
     printf("kernel matvec mode=%d: %u MACs, sum=%lld, tiles=%u (matches C reference)%s\n",
-           mode, QWEN3_HIDDEN_SIZE, (long long)work.accumulator,
+           mode, work.total_tiles * QWEN3_TILE_WIDTH, (long long)work.accumulator,
            work.completed_tiles, mode ? "; actual Qwen3 layer-0 Q-projection row" : "");
     if (mode)
         printf("output Q16: %lld (%.9g); original BF16 reference: %.9g; Q8 weight scale: %.9g\n",

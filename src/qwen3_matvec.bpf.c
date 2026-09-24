@@ -32,7 +32,8 @@ int qwen3_matvec_tile(struct __sk_buff *skb)
 
     work->accumulator += sum;
     work->completed_tiles++;
-    if (work->fixed_point_mode && work->completed_tiles == QWEN3_HIDDEN_TILES) {
+    if (work->fixed_point_mode && work->total_tiles &&
+        work->completed_tiles == work->total_tiles) {
         work->output_q16 = work->fixed_point_mode == 2
             ? work->accumulator >> 24
             : (work->accumulator * work->weight_scale_q24) >> 24;

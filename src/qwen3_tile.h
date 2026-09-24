@@ -17,6 +17,7 @@ struct qwen3_tile {
     __s64 output_q16;
     __s32 weight_scale_q24;
     __u32 completed_tiles;
+    __u32 total_tiles;
     __u32 fixed_point_mode;
 };
 

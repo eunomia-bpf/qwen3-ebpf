@@ -13,9 +13,12 @@ tested dot product. No model weights are distributed here.
 `src/qwen3_matvec.bpf.c` runs integer multiply-accumulate in a socket-filter
 BPF program, with Q8×Q8 and Q16-activation×Q24-weight paths.
 `src/matvec-smoke.c` invokes it with `bpf_prog_test_run_opts`,
-checks the map result after eight 128-element tiles, and compares against a C
+checks the map result after bounded 128-element tiles, and compares against a C
 reference. This test establishes that the arithmetic ran in the kernel BPF VM;
 it does **not** establish that an LLM token can yet be generated.
+The same BPF program also accepts a caller-supplied tile count; `make test`
+now checks a 3,072-element path (24 tiles), matching Qwen3's MLP intermediate
+width, while model-backed Q-projection uses eight tiles.
 
 `src/qwen3_norm.bpf.c` implements RMSNorm as separate accumulate, finalize,
 and apply BPF programs. The split matters: a combined accumulation and

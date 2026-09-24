@@ -23,7 +23,7 @@
 #define QWEN3_VOCAB 151936
 #define QWEN3_Q_HEADS 16
 #define QWEN3_KV_HEADS 8
-#define QWEN3_CONTEXT_LIMIT 2
+#define QWEN3_CONTEXT_LIMIT 40960
 
 static int trace_enabled;
 
@@ -44,11 +44,15 @@ struct qwen3_engine {
 };
 
 struct qwen3_cache {
-    int32_t key[QWEN3_CONTEXT_LIMIT][QWEN3_LAYERS][QWEN3_KV_HEADS]
-               [QWEN3_TILE_WIDTH];
-    int32_t value[QWEN3_CONTEXT_LIMIT][QWEN3_LAYERS][QWEN3_KV_HEADS]
-                 [QWEN3_TILE_WIDTH];
+    int32_t *key;
+    int32_t *value;
 };
+
+static size_t cache_offset(int position, int layer, int head)
+{
+    return (((size_t)position * QWEN3_LAYERS + layer) * QWEN3_KV_HEADS + head)
+           * QWEN3_TILE_WIDTH;
+}
 
 static int call_kernel(int fd)
 {
@@ -112,9 +116,7 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path)
         "qwen3_vector_add", "qwen3_vector_multiply", "qwen3_vector_argmax"
     };
     static const char *rope_programs[] = {"qwen3_rope_apply"};
-    static const char *attention_programs[] = {
-        "qwen3_attention_score", "qwen3_attention_apply"
-    };
+    static const char *attention_programs[] = {"qwen3_attention_step"};
 
     if (safetensors_open(&engine->model, model_path) ||
         open_operator(&engine->matrix, "build/qwen3_matvec.bpf.o",
@@ -128,7 +130,7 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path)
         open_operator(&engine->rope, "build/qwen3_rope.bpf.o",
                       "rope", rope_programs, 1) ||
         open_operator(&engine->attention, "build/qwen3_attention.bpf.o",
-                      "attention", attention_programs, 2))
+                      "attention", attention_programs, 1))
         return -1;
     return 0;
 }
@@ -275,22 +277,18 @@ static int kernel_attention_head(struct qwen3_engine *engine,
     const uint32_t key = 0;
     int past, kv_head = head / 2;
 
-    work.context_length = position + 1;
     memcpy(work.query_q16, query, sizeof(work.query_q16));
     for (past = 0; past <= position; past++) {
-        work.score_index = past;
-        memcpy(work.key_q16, cache->key[past][layer][kv_head],
+        size_t offset = cache_offset(past, layer, kv_head);
+        memcpy(work.key_q16, cache->key + offset,
                sizeof(work.key_q16));
-        memcpy(work.value_q16[past], cache->value[past][layer][kv_head],
-               sizeof(work.value_q16[past]));
+        memcpy(work.value_q16, cache->value + offset,
+               sizeof(work.value_q16));
         if (bpf_map_update_elem(engine->attention.map_fd, &key, &work, BPF_ANY) ||
             call_kernel(engine->attention.program_fd[0]) ||
             bpf_map_lookup_elem(engine->attention.map_fd, &key, &work))
             return -1;
     }
-    if (call_kernel(engine->attention.program_fd[1]) ||
-        bpf_map_lookup_elem(engine->attention.map_fd, &key, &work))
-        return -1;
     memcpy(output, work.output_q16, sizeof(work.output_q16));
     return 0;
 }
@@ -463,7 +461,7 @@ int main(int argc, char **argv)
     int32_t down[QWEN3_HIDDEN_SIZE], *logits = NULL;
     char name[128];
     struct timespec start;
-    uint32_t token_ids[QWEN3_CONTEXT_LIMIT], next_id;
+    uint32_t *token_ids = NULL, next_id;
     unsigned long parsed_token;
     char *endptr;
     const char *dump_path = NULL;
@@ -471,9 +469,12 @@ int main(int argc, char **argv)
     int layer, position, head, token_count = 0, arg, rc = 1;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.safetensors token_id [token_id] [--dump-logits output.i32]\n", argv[0]);
+        fprintf(stderr, "usage: %s model.safetensors token_id... [--dump-logits output.i32]\n", argv[0]);
         return 2;
     }
+    token_ids = calloc((size_t)argc - 2, sizeof(*token_ids));
+    if (!token_ids)
+        return 1;
     arg = 2;
     while (arg < argc && strcmp(argv[arg], "--dump-logits") != 0 &&
            token_count < QWEN3_CONTEXT_LIMIT) {
@@ -482,15 +483,17 @@ int main(int argc, char **argv)
         if (errno || endptr == argv[arg] || *endptr ||
             parsed_token >= QWEN3_VOCAB) {
             fprintf(stderr, "input token ID must be below %d\n", QWEN3_VOCAB);
-            return 2;
+            rc = 2;
+            goto done;
         }
         token_ids[token_count++] = (uint32_t)parsed_token;
         arg++;
     }
     if (!token_count || (arg < argc &&
         (strcmp(argv[arg], "--dump-logits") != 0 || arg + 2 != argc))) {
-        fprintf(stderr, "expected one or two token IDs and optional --dump-logits path\n");
-        return 2;
+        fprintf(stderr, "expected token IDs and optional --dump-logits path\n");
+        rc = 2;
+        goto done;
     }
     if (arg < argc)
         dump_path = argv[arg + 1];
@@ -501,7 +504,13 @@ int main(int argc, char **argv)
     }
     logits = malloc((size_t)QWEN3_VOCAB * sizeof(*logits));
     cache = calloc(1, sizeof(*cache));
-    if (!logits || !cache) {
+    if (cache) {
+        size_t elements = (size_t)token_count * QWEN3_LAYERS *
+                          QWEN3_KV_HEADS * QWEN3_TILE_WIDTH;
+        cache->key = calloc(elements, sizeof(*cache->key));
+        cache->value = calloc(elements, sizeof(*cache->value));
+    }
+    if (!logits || !cache || !cache->key || !cache->value) {
         fprintf(stderr, "could not allocate inference state\n");
         goto done;
     }
@@ -566,9 +575,9 @@ int main(int argc, char **argv)
                             key_vectors + head * QWEN3_TILE_WIDTH))
                 goto layer_fail;
         }
-        memcpy(cache->key[position][layer], key_vectors,
+        memcpy(cache->key + cache_offset(position, layer, 0), key_vectors,
                sizeof(key_vectors));
-        memcpy(cache->value[position][layer], v, sizeof(v));
+        memcpy(cache->value + cache_offset(position, layer, 0), v, sizeof(v));
         for (head = 0; head < QWEN3_Q_HEADS; head++) {
             if (kernel_attention_head(&engine, cache, layer, position, head,
                     query + head * QWEN3_TILE_WIDTH,
@@ -656,7 +665,12 @@ layer_fail:
     fprintf(stderr, "kernel forward failed at position %d layer %d near %s\n",
             position, layer, name);
 done:
+    if (cache) {
+        free(cache->key);
+        free(cache->value);
+    }
     free(cache);
+    free(token_ids);
     free(logits);
     close_engine(&engine);
     return rc;

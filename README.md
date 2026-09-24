@@ -74,6 +74,14 @@ The SiLU check passed with maximum absolute error `0.000634` across 1,024
 inputs in `[-8, 8]` against a C floating-point reference. It is not yet
 combined with Qwen3's MLP gate and up projections.
 
+The full layer-0 V-projection matrix (1,024 rows, 1,048,576 MACs) then ran
+through the BPF matvec with official weights and deterministic activations.
+Its maximum per-row absolute error against the independent BF16 C reference
+was `1.53e-05`; the measured operator test took `0.018 s` on the test host.
+The model file is opened once and its tensor offset resolved once for this
+matrix. This timing excludes model download, compilation, and the rest of a
+decoder layer; it is not an LLM throughput claim.
+
 ## Full-model target and hard problems
 
 The target is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), not a

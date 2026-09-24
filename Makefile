@@ -5,7 +5,7 @@ ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
 
 .PHONY: all test test-model clean
 
-all: build/qwen3_matvec.bpf.o build/matvec-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke
+all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke
 
 build:
 	mkdir -p build
@@ -21,6 +21,9 @@ build/qwen3_silu.bpf.o: src/qwen3_silu.bpf.c src/qwen3_silu.h src/qwen3_tile.h |
 
 build/matvec-smoke: src/matvec-smoke.c src/safetensors.c src/safetensors.h src/qwen3_tile.h | build
 	$(CC) $(CFLAGS) -Isrc src/matvec-smoke.c src/safetensors.c -o $@ -lbpf -lelf -lz
+
+build/matrix-smoke: src/matrix-smoke.c src/safetensors.c src/safetensors.h src/qwen3_tile.h | build
+	$(CC) $(CFLAGS) -Isrc src/matrix-smoke.c src/safetensors.c -o $@ -lbpf -lelf -lz -lm
 
 build/norm-smoke: src/norm-smoke.c src/safetensors.c src/safetensors.h src/qwen3_norm.h | build
 	$(CC) $(CFLAGS) -Isrc src/norm-smoke.c src/safetensors.c -o $@ -lbpf -lelf -lz -lm

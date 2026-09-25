@@ -21,7 +21,13 @@ reference. That operator test alone does not establish model inference; the
 separate inference driver below connects all decoder layers.
 The same BPF program also accepts a caller-supplied tile count; `make test`
 now checks a 3,072-element path (24 tiles), matching Qwen3's MLP intermediate
-width, while model-backed Q-projection uses eight tiles.
+width. The original tile program remains an operator test. Full inference now
+uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to four complete matrix
+rows per invocation. Its 61 KiB work map is memory-mapped into C, so the
+driver writes weights and activations and reads results without per-batch map
+update/lookup syscalls. The weights still come from the BF16 model file and
+are converted to Q24 in C for each forward pass; this is not yet a resident
+quantized-weight or arena implementation.
 
 `src/qwen3_norm.bpf.c` implements RMSNorm as separate accumulate, finalize,
 and apply BPF programs. The split matters: a combined accumulation and
@@ -134,6 +140,16 @@ two inputs. The top three IDs agreed for both. Measured forward times were
 8.47 s and 8.57 s, excluding model download, compilation, and container
 startup. These are two-input experimental checks, not a general accuracy or
 performance guarantee.
+
+After the batched, mmap-backed matrix change, a same-host run in the same
+Ubuntu 24.04 container measured 8.526 s for the previous tile driver and
+3.695 s for the new driver on input token `0`. Their 151,936 Q16 logits
+matched byte for byte. The new driver also produced ` This` for the
+`Hello, world!` text prompt in 8.817 s, and generated `220, 16` from
+`[0, 1]` in 6.866 s; both corresponding logit dumps matched the prior
+kernel runs byte for byte. Each duration is a single run, not a throughput
+distribution or proof of a general speedup. The inference workload remains
+far slower than conventional optimized model inference.
 
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean

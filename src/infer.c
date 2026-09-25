@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "qwen3_norm.h"
@@ -14,6 +16,7 @@
 #include "qwen3_attention.h"
 #include "qwen3_silu.h"
 #include "qwen3_tile.h"
+#include "qwen3_batch.h"
 #include "qwen3_vector.h"
 #include "qwen3_tokenizer.h"
 #include "safetensors.h"
@@ -37,7 +40,10 @@ struct kernel_operator {
 
 struct qwen3_engine {
     struct safetensors_file model;
-    struct kernel_operator matrix;
+    struct kernel_operator batch;
+    void *batch_mapping;
+    size_t batch_mapping_len;
+    struct qwen3_batch_work *batch_work;
     struct kernel_operator norm;
     struct kernel_operator silu;
     struct kernel_operator vector;
@@ -98,7 +104,9 @@ static int open_operator(struct kernel_operator *op, const char *path,
 
 static void close_engine(struct qwen3_engine *engine)
 {
-    bpf_object__close(engine->matrix.object);
+    if (engine->batch_mapping)
+        munmap(engine->batch_mapping, engine->batch_mapping_len);
+    bpf_object__close(engine->batch.object);
     bpf_object__close(engine->norm.object);
     bpf_object__close(engine->silu.object);
     bpf_object__close(engine->vector.object);
@@ -109,7 +117,7 @@ static void close_engine(struct qwen3_engine *engine)
 
 static int open_engine(struct qwen3_engine *engine, const char *model_path)
 {
-    static const char *matrix_programs[] = {"qwen3_matvec_tile"};
+    static const char *batch_programs[] = {"qwen3_batch_rows"};
     static const char *norm_programs[] = {
         "qwen3_rms_accumulate", "qwen3_rms_finalize", "qwen3_rms_apply"
     };
@@ -119,10 +127,11 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path)
     };
     static const char *rope_programs[] = {"qwen3_rope_apply"};
     static const char *attention_programs[] = {"qwen3_attention_step"};
+    size_t page, length;
 
     if (safetensors_open(&engine->model, model_path) ||
-        open_operator(&engine->matrix, "build/qwen3_matvec.bpf.o",
-                      "tile", matrix_programs, 1) ||
+        open_operator(&engine->batch, "build/qwen3_batch.bpf.o",
+                      "batch", batch_programs, 1) ||
         open_operator(&engine->norm, "build/qwen3_norm.bpf.o",
                       "norm", norm_programs, 3) ||
         open_operator(&engine->silu, "build/qwen3_silu.bpf.o",
@@ -134,6 +143,16 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path)
         open_operator(&engine->attention, "build/qwen3_attention.bpf.o",
                       "attention", attention_programs, 1))
         return -1;
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    length = ((sizeof(struct qwen3_batch_work) + page - 1) / page) * page;
+    engine->batch_mapping = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, engine->batch.map_fd, 0);
+    if (engine->batch_mapping == MAP_FAILED) {
+        engine->batch_mapping = NULL;
+        return -1;
+    }
+    engine->batch_mapping_len = length;
+    engine->batch_work = engine->batch_mapping;
     return 0;
 }
 
@@ -300,11 +319,12 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
                          int repeat_v, int32_t *output)
 {
     uint64_t first_byte, elements;
-    const uint32_t key = 0;
     float *weights;
-    int row, tile, i, rc = -1;
+    struct qwen3_batch_work *work = engine->batch_work;
+    int row, batch_row, i, rc = -1;
 
     if (cols % QWEN3_TILE_WIDTH || rows <= 0 || cols <= 0 ||
+        cols > QWEN3_BATCH_COLS ||
         safetensors_find_bf16(&engine->model, name,
                               &first_byte, &elements) ||
         elements != (uint64_t)rows * cols) {
@@ -314,44 +334,45 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
     weights = malloc((size_t)cols * sizeof(*weights));
     if (!weights)
         return -1;
-    for (row = 0; row < rows; row++) {
-        struct qwen3_tile work = {0};
-        if (safetensors_read_bf16_at(&engine->model, first_byte,
-                (uint64_t)row * cols, (size_t)cols, weights)) {
-            fprintf(stderr, "matrix read failed for %s row %d\n", name, row);
-            goto done;
-        }
-        work.fixed_point_mode = 2;
-        work.total_tiles = cols / QWEN3_TILE_WIDTH;
-        for (tile = 0; tile < (int)work.total_tiles; tile++) {
-            for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-                int index = tile * QWEN3_TILE_WIDTH + i;
-                int input_index = repeat_v
-                    ? (index / QWEN3_TILE_WIDTH / 2) * QWEN3_TILE_WIDTH +
-                      index % QWEN3_TILE_WIDTH
-                    : index;
-                work.activation_q16[i] = input[input_index];
-                if (convert_q24(weights[index], &work.weight_q24[i])) {
-                    fprintf(stderr, "matrix Q24 conversion failed for %s row %d col %d value %.9g\n",
-                            name, row, index, weights[index]);
-                    goto done;
-                }
-            }
-            if (bpf_map_update_elem(engine->matrix.map_fd, &key, &work, BPF_ANY) ||
-                call_kernel(engine->matrix.program_fd[0]) ||
-                bpf_map_lookup_elem(engine->matrix.map_fd, &key, &work)) {
-                perror("BPF matrix tile");
-                fprintf(stderr, "matrix %s row %d tile %d\n", name, row, tile);
+    work->cols = (uint32_t)cols;
+    for (i = 0; i < cols; i++)
+        work->input_q16[i] = input[repeat_v
+            ? (i / QWEN3_TILE_WIDTH / 2) * QWEN3_TILE_WIDTH +
+              i % QWEN3_TILE_WIDTH
+            : i];
+    for (row = 0; row < rows; row += QWEN3_BATCH_ROWS) {
+        work->rows = (uint32_t)(rows - row < QWEN3_BATCH_ROWS
+            ? rows - row : QWEN3_BATCH_ROWS);
+        work->completed = 0;
+        for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
+            if (safetensors_read_bf16_at(&engine->model, first_byte,
+                    (uint64_t)(row + batch_row) * cols,
+                    (size_t)cols, weights)) {
+                fprintf(stderr, "matrix read failed for %s row %d\n",
+                        name, row + batch_row);
                 goto done;
             }
+            for (i = 0; i < cols; i++)
+                if (convert_q24(weights[i],
+                                &work->weight_q24[batch_row][i])) {
+                    fprintf(stderr, "matrix Q24 conversion failed for %s row %d col %d value %.9g\n",
+                            name, row + batch_row, i, weights[i]);
+                    goto done;
+                }
         }
-        if (work.completed_tiles != work.total_tiles ||
-            work.output_q16 > INT32_MAX || work.output_q16 < INT32_MIN) {
-            fprintf(stderr, "matrix %s row %d output out of Q16 range: %lld\n",
-                    name, row, (long long)work.output_q16);
+        if (call_kernel(engine->batch.program_fd[0])) {
+            perror("BPF matrix batch");
+            fprintf(stderr, "matrix %s row %d\n", name, row);
             goto done;
         }
-        output[row] = (int32_t)work.output_q16;
+        if (work->completed != work->rows)
+            goto done;
+        for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
+            if (work->output_q16[batch_row] > INT32_MAX ||
+                work->output_q16[batch_row] < INT32_MIN)
+                goto done;
+            output[row + batch_row] = (int32_t)work->output_q16[batch_row];
+        }
     }
     rc = 0;
 done:

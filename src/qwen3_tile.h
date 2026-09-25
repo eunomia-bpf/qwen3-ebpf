@@ -6,6 +6,8 @@
 #define QWEN3_TILE_WIDTH 128
 #define QWEN3_HIDDEN_SIZE 1024
 #define QWEN3_HIDDEN_TILES (QWEN3_HIDDEN_SIZE / QWEN3_TILE_WIDTH)
+#define QWEN3_Q_HEADS 16
+#define QWEN3_KV_HEADS 8
 
 /* One Q8 x Q8 tile. The loader only supplies data; the dot product runs in BPF. */
 struct qwen3_tile {

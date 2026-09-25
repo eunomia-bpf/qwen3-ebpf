@@ -270,6 +270,16 @@ still produced IDs `220, 16`. One-token `bpf` calls fell from 7,217 to
 5,229. This is a measured syscall reduction, not a controlled wall-clock
 speedup claim.
 
+Q/K RMSNorm now processes all 16 query and eight key heads in one bounded
+`bpf_loop` invocation per layer. An official-weight operator check matched
+the previous 24 separate BPF calls element for element; complete-vocabulary
+logits for token `0`, `Hello, world!`, and a two-token generation check were
+byte-identical. With both versions loading the same BPF object, one-token
+`bpf` calls fell from 5,231 to 4,587, exactly 644 fewer calls across 28
+layers. Three interleaved warm one-token runs took 1.204/1.242/1.199 s
+before and 1.221/1.138/1.209 s after. The calls fell, but these timings
+do not establish a latency gain.
+
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
 An exhaustive conversion test checks representable finite patterns against
@@ -341,9 +351,10 @@ remove the dense matrix cost. C also loads BF16 tensors, converts each active
 row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
-`bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, up to
-24 vector or SiLU tiles or RoPE heads, and up to 256 attention-history items per
-invocation. It does not turn a 28-layer model into one BPF invocation:
+`bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, all 24 Q/K
+normalization heads, up to 24 vector or SiLU tiles or RoPE heads, and up to
+256 attention-history items per invocation. It does not turn a 28-layer model
+into one BPF invocation:
 matrix batches, normalization calls, and token-by-token generation still
 cross the user/kernel boundary. Bounded units keep verifier complexity and
 per-invocation runtime manageable. The attention smoke test crosses the

@@ -17,4 +17,13 @@ struct qwen3_int4_work {
     __u32 completed;
 };
 
+/* The optional arena operator keeps only activations and results in this map. */
+struct qwen3_arena_int4_work {
+    __s32 input_q16[QWEN3_INT4_COLS];
+    __s64 output_q16[QWEN3_INT4_ROWS];
+    __u32 rows;
+    __u32 cols;
+    __u32 completed;
+};
+
 #endif

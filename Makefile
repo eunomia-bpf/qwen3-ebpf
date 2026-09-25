@@ -2,8 +2,14 @@ CLANG ?= clang
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -Werror
 ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
+ARENA_CLANG ?= clang-19
+ARENA_BPFTOOL ?= bpftool
+ARENA_ARCH ?= $(shell uname -m | sed 's/aarch64/arm64/')
+ARENA_LIBBPF_INCLUDE ?= /usr/include
+ARENA_UAPI_INCLUDE ?= /usr/include
+ARENA_LIBBPF ?= -lbpf
 
-.PHONY: all test test-model test-tokenizer clean
+.PHONY: all test test-model test-tokenizer test-arena-int4 clean
 
 all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_batch.bpf.o build/batch-smoke build/qwen3_int4.bpf.o build/int4-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/qwen3_rope.bpf.o build/rope-smoke build/qwen3_attention.bpf.o build/attention-smoke build/infer build/safetensors-smoke
 
@@ -24,6 +30,19 @@ build/qwen3_int4.bpf.o: src/qwen3_int4.bpf.c src/qwen3_int4.h | build
 
 build/int4-smoke: src/int4-smoke.c src/qwen3_int4.h src/safetensors.c src/safetensors.h | build
 	$(CC) $(CFLAGS) -Isrc src/int4-smoke.c src/safetensors.c -o $@ -lbpf -lelf -lz -lm
+
+# Optional: arena globals require Clang 19 and libbpf/bpftool with arena support.
+build/qwen3_arena_int4.tmp.bpf.o: src/qwen3_arena_int4.bpf.c src/qwen3_int4.h | build
+	$(ARENA_CLANG) -O2 -g -target bpf -D__TARGET_ARCH_$(ARENA_ARCH) -I$(ARCH_INCLUDE) -I$(ARENA_LIBBPF_INCLUDE) -I$(ARENA_UAPI_INCLUDE) -Isrc -c $< -o $@
+
+build/qwen3_arena_int4.bpf.o: build/qwen3_arena_int4.tmp.bpf.o
+	$(ARENA_BPFTOOL) gen object $@ $<
+
+build/qwen3_arena_int4.skel.h: build/qwen3_arena_int4.bpf.o
+	$(ARENA_BPFTOOL) gen skeleton $< > $@
+
+build/arena-int4-smoke: src/arena-int4-smoke.c src/qwen3_int4.h src/safetensors.c src/safetensors.h build/qwen3_arena_int4.skel.h | build
+	$(CC) $(CFLAGS) -Isrc -Ibuild -I$(ARENA_LIBBPF_INCLUDE) -I$(ARENA_UAPI_INCLUDE) src/arena-int4-smoke.c src/safetensors.c -o $@ $(ARENA_LIBBPF) -lelf -lz -lm
 
 build/qwen3_norm.bpf.o: src/qwen3_norm.bpf.c src/qwen3_norm.h src/qwen3_tile.h | build
 	$(CLANG) -O2 -g -target bpf -I$(ARCH_INCLUDE) -Isrc -c $< -o $@
@@ -89,6 +108,9 @@ test-model: all
 test-tokenizer: build/tokenizer-smoke
 	test -n "$(TOKENIZER)"
 	./build/tokenizer-smoke "$(TOKENIZER)"
+
+test-arena-int4: build/arena-int4-smoke
+	./build/arena-int4-smoke $(if $(MODEL),"$(MODEL)")
 
 clean:
 	rm -r build

@@ -36,6 +36,18 @@ matrix operator with packed nibbles and Q24 group scales. Its operator smoke
 test checks the BPF result against the same packed calculation in C; it is not
 used by the complete inference driver.
 
+`src/qwen3_arena_int4.bpf.c` is an optional arena-resident version of that
+operator: C writes 16 packed rows and their scales into a shared BPF arena,
+and the BPF matrix callbacks read weights directly from the arena instead of
+copying them into the per-invocation work map. On Linux 6.17 arm64 with Clang
+19, libbpf 1.7, and bpftool 7.7, its synthetic 16-row check matched the C
+integer reference. With an official model row, BF16, C INT4, and BPF arena
+INT4 dots were `0.125738472`, `0.119238757`, and `0.119232178` (the same
+INT4 result as the non-arena operator). This proves a bounded arena weight
+read, not whole-model weight residency, acceptable INT4 generation quality,
+or a speedup. It is not in the default `make test` or inference path because
+the latter still uses the portable, more accurate Q24 path.
+
 `src/qwen3_norm.bpf.c` implements RMSNorm in one BPF invocation. Two bounded
 `bpf_loop` callbacks accumulate and apply up to eight 128-element tiles around
 the integer-square-root step. Its work map is memory-mapped, so C can supply
@@ -76,6 +88,13 @@ Oniguruma development headers, make, and BPF loading privileges:
 make test
 make test-tokenizer TOKENIZER=/path/to/tokenizer.json
 ```
+
+If Clang 19, libbpf with arena support, and bpftool are available, the
+separate arena operator check is `make test-arena-int4
+MODEL=/path/to/model.safetensors`. Without `MODEL`, it runs the synthetic
+check only. `ARENA_LIBBPF_INCLUDE`, `ARENA_UAPI_INCLUDE`, and
+`ARENA_LIBBPF` can point to an external recent libbpf build; the normal
+build does not need these dependencies.
 
 The test loads an ephemeral BPF program and map; it attaches to no network
 interface and installs nothing persistently.
@@ -325,9 +344,10 @@ per-invocation runtime manageable. The attention smoke test crosses the
 256-item boundary, but a full long-context model run
 has not been validated.
 
-The mmap-backed array is sufficient for the current shared working buffers;
-an arena is not yet used for resident model weights. Arena allocation alone
-would not make 0.6B parameters fit cheaply or remove their conversion cost.
+The mmap-backed array is sufficient for the current inference working
+buffers. Only the optional 16-row INT4 operator reads arena-resident weights;
+the full model does not. Arena allocation alone would not make 0.6B
+parameters fit cheaply or remove their conversion cost.
 The current KV layout reserves 1,024 bytes for each position/layer/KV-head
 pair, about 224 KiB per position and 8.75 GiB at 40,960 positions, before
 weights and other buffers. It may fail under real memory limits. Q24 is the

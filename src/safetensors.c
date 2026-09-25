@@ -164,6 +164,32 @@ int safetensors_read_bf16_q24_at(struct safetensors_file *file,
     return 0;
 }
 
+int safetensors_read_bf16_bits_at(struct safetensors_file *file,
+                                  uint64_t first_byte, uint64_t first,
+                                  size_t count, uint16_t *out)
+{
+    const uint8_t *raw;
+    size_t data_offset, payload_size;
+
+    if (!file || !file->mapping || !out || !count || count > SIZE_MAX / 2)
+        return -1;
+    data_offset = 8 + (size_t)file->header_length;
+    payload_size = file->mapping_size - data_offset;
+    if (first_byte > payload_size ||
+        first > (payload_size - (size_t)first_byte) / 2 ||
+        count > (payload_size - (size_t)first_byte) / 2 - (size_t)first)
+        return -1;
+    raw = file->mapping + data_offset + (size_t)first_byte + (size_t)first * 2;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    memcpy(out, raw, count * sizeof(*out));
+#else
+    size_t i;
+    for (i = 0; i < count; i++)
+        out[i] = (uint16_t)raw[2 * i] | (uint16_t)raw[2 * i + 1] << 8;
+#endif
+    return 0;
+}
+
 int safetensors_read_bf16(const char *path, const char *tensor,
                           uint64_t first, size_t count, float *out)
 {

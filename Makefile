@@ -104,6 +104,9 @@ build/tokenizer-smoke: src/tokenizer-smoke.c src/qwen3_tokenizer.c src/qwen3_tok
 build/infer: src/infer.c src/safetensors.c src/safetensors.h src/qwen3_tokenizer.c src/qwen3_tokenizer.h src/qwen3_tile.h src/qwen3_batch.h src/qwen3_norm.h src/qwen3_silu.h src/qwen3_vector.h src/qwen3_rope.h src/qwen3_attention.h | build
 	$(CC) $(CFLAGS) -Isrc src/infer.c src/safetensors.c src/qwen3_tokenizer.c -o $@ -lbpf -lelf -lz -lm -ljson-c -lonig
 
+build/infer-arena-bf16: src/infer.c src/safetensors.c src/safetensors.h src/qwen3_tokenizer.c src/qwen3_tokenizer.h src/qwen3_arena_bf16.h build/qwen3_arena_bf16.skel.h | build
+	$(CC) $(CFLAGS) -DQWEN3_USE_ARENA_BF16 -Isrc -Ibuild -I$(ARENA_LIBBPF_INCLUDE) -I$(ARENA_UAPI_INCLUDE) src/infer.c src/safetensors.c src/qwen3_tokenizer.c -o $@ $(ARENA_LIBBPF) -lelf -lz -lm -ljson-c -lonig
+
 build/safetensors-smoke: src/safetensors-smoke.c src/safetensors.c src/safetensors.h | build
 	$(CC) $(CFLAGS) -Isrc src/safetensors-smoke.c src/safetensors.c -o $@ -lm
 

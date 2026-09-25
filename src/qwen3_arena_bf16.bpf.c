@@ -7,7 +7,7 @@
 struct {
     __uint(type, BPF_MAP_TYPE_ARENA);
     __uint(map_flags, BPF_F_MMAPABLE);
-    __uint(max_entries, 128);
+    __uint(max_entries, 512);
 #ifdef __TARGET_ARCH_arm64
     __ulong(map_extra, 0x1ull << 32);
 #else
@@ -47,6 +47,11 @@ static long compute_row(__u32 row, void *ctx)
         sum += (__s64)state->input_q16[i] * q24_by_bf16[bits];
     }
     state->output_q16[bounded_row] = sum >> 24;
+    if (state->track_argmax &&
+        state->output_q16[bounded_row] > state->best_q16) {
+        state->best_q16 = state->output_q16[bounded_row];
+        state->best_index = state->base_index + row;
+    }
     state->completed++;
     return 0;
 }

@@ -7,8 +7,9 @@ next token ID in the kernel. Greedy decoding can reuse the cache to produce
 additional token IDs. The KV cache lives in a BPF array map; the attention
 operator writes new K/V pairs and scans up to 256 prior positions per
 invocation using `bpf_loop`.
-The host loads and quantizes official BF16 weights, dispatches bounded
-BPF tiles, and reads results; model arithmetic and argmax run in eBPF. A C
+The default host path loads and converts official BF16 weights, dispatches
+bounded BPF tiles, and reads results; an optional arena path instead passes
+BF16 rows to BPF for exact Q24 lookup. Model arithmetic and argmax run in eBPF. A C
 ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
 data are distributed here.
 
@@ -28,8 +29,7 @@ rows per invocation. Its approximately 1.51 MiB work map is memory-mapped
 into C, so the driver writes weights and activations and reads results without
 per-batch map update/lookup syscalls. The BF16 model file is mapped read-only
 once, avoiding per-row file seeks, reads, and allocations; active rows are
-still converted to Q24 in C for each forward pass. This is not yet a resident
-quantized-weight or arena implementation.
+still converted to Q24 in C for each forward pass on the default path.
 
 `src/qwen3_int4.bpf.c` separately tests a 16-row, group-128 signed-INT4
 matrix operator with packed nibbles and Q24 group scales. Its operator smoke
@@ -54,14 +54,20 @@ read, not whole-model weight residency, acceptable INT4 generation quality,
 or a speedup. It is not in the default `make test` or inference path because
 the latter still uses the portable, more accurate Q24 path.
 
-`src/qwen3_arena_bf16.bpf.c` tests a different exact-weight route: it keeps
+`src/qwen3_arena_bf16.bpf.c` provides a separate exact-weight route: it keeps
 raw BF16 matrix rows and a 65,536-entry BF16-to-Q24 lookup table in the
 arena. BPF reads a BF16 value, obtains the same Q24 integer used by the
 default driver, and computes the dot product without C converting or copying
-Q24 weights for that invocation. On the test kernel, all 16 synthetic rows
-and 16 official Q-projection rows matched the C Q24 reference exactly. The
-test occupies only a bounded arena region; it does not show that all model
-weights can reside there or that the complete driver is faster.
+Q24 weights for that invocation. The optional `build/infer-arena-bf16` driver
+reuses a roughly 2 MiB arena for batches of 128 rows rather than loading the
+whole model into it. On the test kernel, 128 synthetic and 128 official
+Q-projection rows matched the C Q24 reference. Complete inference for input
+token `0` and the two-token `Hello, world!` generation returned the same
+token IDs and byte-identical 151,936 logits as the default path. Six
+interleaved one-token runs measured 1.227/1.190/1.251 s on the default
+path and 1.220/1.228/1.234 s with the arena path; these samples do not show
+a stable speedup. The optional path needs arena-capable Linux/libbpf and is
+not the default build.
 
 `src/qwen3_norm.bpf.c` implements RMSNorm in one BPF invocation. Two bounded
 `bpf_loop` callbacks accumulate and apply up to eight 128-element tiles around
@@ -111,6 +117,13 @@ separate arena operator checks are `make test-arena-int4` and
 check only. `ARENA_LIBBPF_INCLUDE`, `ARENA_UAPI_INCLUDE`, and
 `ARENA_LIBBPF` can point to an external recent libbpf build; the normal
 build does not need these dependencies.
+
+To build and run full-model inference with bounded BF16 arena batches on
+that newer toolchain, use `make build/infer-arena-bf16` and invoke it with
+the same arguments as `build/infer`. The model stays in the read-only
+Safetensors mapping; C copies each active BF16 batch into the arena, and BPF
+does the BF16-to-Q24 lookup and matrix dot. This is kernel-side weight access,
+not whole-model weight residency.
 
 The test loads an ephemeral BPF program and map; it attaches to no network
 interface and installs nothing persistently.
@@ -393,10 +406,11 @@ has not been validated.
 
 Mmap-backed arrays are sufficient for the current inference working buffers;
 the KV cache is a separate BPF array written by the attention program. Only
-the optional INT4 and BF16 lookup operators read arena-resident weights;
-the full model does not. The BF16 lookup path preserves Q24 integer weights
-without storing them as four-byte values, but full-model arena residency,
-memory pressure, and speed remain untested. Arena allocation alone would
+the optional INT4 operator and full-model BF16 arena path read arena-resident
+weight batches; the whole model is not resident there. The BF16 lookup path
+preserves Q24 integer weights without storing them as four-byte values, but
+whole-model arena residency remains untested and the bounded path did not
+show a stable speedup. Arena allocation alone would
 not make 0.6B parameters fit cheaply or remove their conversion cost.
 The current KV layout reserves 1,024 bytes for each position/layer/KV-head
 pair, about 224 KiB per position and 8.75 GiB at 40,960 positions, before

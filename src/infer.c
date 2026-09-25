@@ -20,6 +20,10 @@
 #include "qwen3_vector.h"
 #include "qwen3_tokenizer.h"
 #include "safetensors.h"
+#ifdef QWEN3_USE_ARENA_BF16
+#include "qwen3_arena_bf16.h"
+#include "qwen3_arena_bf16.skel.h"
+#endif
 
 #define QWEN3_LAYERS 28
 #define QWEN3_INTERMEDIATE 3072
@@ -66,6 +70,13 @@ struct qwen3_engine {
     struct kernel_operator vector;
     struct kernel_operator rope;
     struct kernel_operator attention;
+#ifdef QWEN3_USE_ARENA_BF16
+    struct qwen3_arena_bf16_bpf *arena_skel;
+    void *arena_work_mapping;
+    size_t arena_work_mapping_len;
+    struct qwen3_arena_bf16_work *arena_work;
+    uint8_t arena_weight_valid[UINT16_MAX + 1];
+#endif
 };
 
 static int call_kernel(int fd)
@@ -128,6 +139,11 @@ static void *map_shared(int fd, size_t bytes, size_t *length)
 
 static void close_engine(struct qwen3_engine *engine)
 {
+#ifdef QWEN3_USE_ARENA_BF16
+    if (engine->arena_work_mapping)
+        munmap(engine->arena_work_mapping, engine->arena_work_mapping_len);
+    qwen3_arena_bf16_bpf__destroy(engine->arena_skel);
+#endif
     if (engine->batch_mapping)
         munmap(engine->batch_mapping, engine->batch_mapping_len);
     if (engine->norm_mapping)
@@ -211,6 +227,30 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         !engine->vector_mapping || !engine->rope_mapping ||
         !engine->attention_heads_mapping)
         return -1;
+#ifdef QWEN3_USE_ARENA_BF16
+    engine->arena_skel = qwen3_arena_bf16_bpf__open_and_load();
+    if (!engine->arena_skel)
+        return -1;
+    engine->arena_work_mapping = map_shared(
+        bpf_map__fd(engine->arena_skel->maps.work),
+        sizeof(struct qwen3_arena_bf16_work),
+        &engine->arena_work_mapping_len);
+    if (!engine->arena_work_mapping)
+        return -1;
+    engine->arena_work = engine->arena_work_mapping;
+    for (uint32_t bits = 0; bits <= UINT16_MAX; bits++) {
+        uint32_t float_bits = bits << 16;
+        float value;
+        double scaled;
+        memcpy(&value, &float_bits, sizeof(value));
+        scaled = (double)value * 16777216.0;
+        engine->arena_weight_valid[bits] = isfinite(scaled) &&
+            scaled <= INT32_MAX && scaled >= INT32_MIN;
+        engine->arena_skel->arena->q24_by_bf16[bits] =
+            engine->arena_weight_valid[bits]
+            ? (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5)) : 0;
+    }
+#endif
     engine->batch_work = engine->batch_mapping;
     engine->norm_work = engine->norm_mapping;
     engine->qk_norm_work = engine->qk_norm_mapping;
@@ -414,6 +454,66 @@ static int kernel_attention_heads(struct qwen3_engine *engine,
     return 0;
 }
 
+#ifdef QWEN3_USE_ARENA_BF16
+static int kernel_matrix_arena(struct qwen3_engine *engine,
+                               const char *name, uint64_t first_byte,
+                               int rows, int cols, const int32_t *input,
+                               int repeat_v, int32_t *output)
+{
+    struct qwen3_arena_bf16_work *work = engine->arena_work;
+    struct qwen3_arena_bf16_bpf *skel = engine->arena_skel;
+    int row, batch_row, i;
+
+    work->cols = (uint32_t)cols;
+    work->track_argmax = engine->batch_work->track_argmax;
+    work->best_q16 = engine->batch_work->best_q16;
+    work->best_index = engine->batch_work->best_index;
+    for (i = 0; i < cols; i++)
+        work->input_q16[i] = input[repeat_v
+            ? (i / QWEN3_TILE_WIDTH / 2) * QWEN3_TILE_WIDTH +
+              i % QWEN3_TILE_WIDTH
+            : i];
+    for (row = 0; row < rows; row += QWEN3_ARENA_BF16_ROWS) {
+        work->rows = (uint32_t)(rows - row < QWEN3_ARENA_BF16_ROWS
+            ? rows - row : QWEN3_ARENA_BF16_ROWS);
+        work->base_index = (uint32_t)row;
+        work->completed = 0;
+        for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
+            uint16_t *weights = skel->arena->weight_bf16[batch_row];
+            if (safetensors_read_bf16_bits_at(&engine->model, first_byte,
+                    (uint64_t)(row + batch_row) * cols,
+                    (size_t)cols, weights)) {
+                fprintf(stderr, "matrix BF16 read failed for %s row %d\n",
+                        name, row + batch_row);
+                return -1;
+            }
+            for (i = 0; i < cols; i++) {
+                if (!engine->arena_weight_valid[weights[i]]) {
+                    fprintf(stderr, "matrix BF16 weight out of Q24 range for %s\n",
+                            name);
+                    return -1;
+                }
+            }
+        }
+        if (call_kernel(bpf_program__fd(skel->progs.qwen3_arena_bf16_rows)) ||
+            work->completed != work->rows) {
+            fprintf(stderr, "arena BF16 matrix failed for %s row %d\n",
+                    name, row);
+            return -1;
+        }
+        for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
+            if (work->output_q16[batch_row] > INT32_MAX ||
+                work->output_q16[batch_row] < INT32_MIN)
+                return -1;
+            output[row + batch_row] = (int32_t)work->output_q16[batch_row];
+        }
+    }
+    engine->batch_work->best_q16 = work->best_q16;
+    engine->batch_work->best_index = work->best_index;
+    return 0;
+}
+#endif
+
 static int kernel_matrix(struct qwen3_engine *engine, const char *name,
                          int rows, int cols, const int32_t *input,
                          int repeat_v, int32_t *output)
@@ -430,6 +530,10 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
         fprintf(stderr, "matrix metadata mismatch for %s\n", name);
         return -1;
     }
+#ifdef QWEN3_USE_ARENA_BF16
+    return kernel_matrix_arena(engine, name, first_byte, rows, cols,
+                               input, repeat_v, output);
+#endif
     work->cols = (uint32_t)cols;
     for (i = 0; i < cols; i++)
         work->input_q16[i] = input[repeat_v

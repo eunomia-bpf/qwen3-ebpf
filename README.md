@@ -4,8 +4,9 @@ An experimental C/libbpf implementation of Qwen3-0.6B forward
 computation in Linux eBPF. The current milestone runs **all 28 decoder layers
 for multi-token contexts**, projects to the full vocabulary, and produces the
 next token ID in the kernel. Greedy decoding can reuse the cache to produce
-additional token IDs. Its attention operator processes one historical
-KV pair per BPF invocation, with a C-managed cache sized to the input length.
+additional token IDs. The KV cache is shared through a memory-mapped BPF map;
+the attention operator scans up to 256 prior positions per BPF invocation
+using `bpf_loop`.
 The host loads and quantizes official BF16 weights, dispatches bounded
 BPF tiles, and reads results; model arithmetic and argmax run in eBPF. A C
 ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
@@ -42,10 +43,14 @@ eBPF, without a user-space lookup or per-input host computation.
 and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
 `src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
 `src/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
-softmax/V reduction for each prior position. `src/infer.c` composes these operators with all model
+softmax/V reduction for each prior position. It reads KV pairs from a
+memory-mapped BPF map and traverses history in bounded `bpf_loop` chunks;
+C writes each newly generated K/V pair directly to that map. `src/infer.c`
+composes these operators with all model
 tensors, including Q/K projection, QK normalization, RoPE, causal attention,
-and grouped-query head sharing. The C-managed KV cache is sized to the prompt;
-the cached vectors and attention arithmetic are produced in eBPF.
+and grouped-query head sharing. The KV map is sized to the requested input
+and generation length; the cached vectors and attention arithmetic are
+produced in eBPF.
 For a one-token context, attention softmax has exactly one entry and is exactly
 1. Longer contexts exercise the actual Q/K and attention path.
 
@@ -150,6 +155,16 @@ matched byte for byte. The new driver also produced ` This` for the
 kernel runs byte for byte. Each duration is a single run, not a throughput
 distribution or proof of a general speedup. The inference workload remains
 far slower than conventional optimized model inference.
+
+With the mmap-backed KV cache and batched attention path, a further same-host
+single run measured 2.790 s for input token `0` and 7.502 s for
+`Hello, world!`. The `[0, 1]` two-token generation run took 5.736 s.
+Their full-vocabulary logits matched the preceding kernel implementation
+byte for byte. These isolated timings are not statistically stable speedup
+estimates, and the cache still uses a dense map allocation proportional to
+the requested context length. The kernel scans history in chunks rather
+than one unbounded invocation; large-context capacity and latency have not
+been validated.
 
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean

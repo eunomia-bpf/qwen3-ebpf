@@ -23,8 +23,8 @@ separate inference driver below connects all decoder layers.
 The same BPF program also accepts a caller-supplied tile count; `make test`
 now checks a 3,072-element path (24 tiles), matching Qwen3's MLP intermediate
 width. The original tile program remains an operator test. Full inference now
-uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to four complete matrix
-rows per invocation. Its 61 KiB work map is memory-mapped into C, so the
+uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to 16 complete matrix
+rows per invocation. Its 204 KiB work map is memory-mapped into C, so the
 driver writes weights and activations and reads results without per-batch map
 update/lookup syscalls. The BF16 model file is mapped read-only once, avoiding
 per-row file seeks, reads, and allocations; active rows are still converted to
@@ -178,6 +178,15 @@ measured 2.912 s before and 2.695 s after this change, with byte-identical
 full-vocabulary logits. These are individual observations, not a controlled
 benchmark or a speedup guarantee; many operator dispatches remain.
 
+Increasing the matrix batch from 4 to 16 rows reduced one-token `bpf`
+syscalls from 143,667 to 50,667 in the same test container. Individual
+one-token runs measured 2.695 s at 4 rows and 1.605 s at 16 rows. An
+experimental 32-row version loaded and returned identical logits, but its
+single measured 1.626 s did not establish a further benefit; the smaller
+16-row work map is retained. The final 16-row path also reproduced the
+earlier byte-identical logits for `Hello, world!` and `[0, 1] --generate 2`.
+These timings are exploratory, not a controlled performance distribution.
+
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean
 absolute error was `0.024` and RMSE `0.030`; the top three token IDs agreed.
@@ -227,7 +236,7 @@ remove the dense matrix cost. C also loads BF16 tensors, converts each active
 row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
-`bpf_loop` now batches four matrix rows and up to 256 attention-history items
+`bpf_loop` now batches 16 matrix rows and up to 256 attention-history items
 per invocation. It does not turn a 28-layer model into one BPF invocation:
 matrix batches, normalization stages, and token-by-token generation still
 cross the user/kernel boundary. Bounded units keep verifier complexity and

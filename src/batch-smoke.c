@@ -90,7 +90,8 @@ int main(int argc, char **argv)
     program = bpf_object__find_program_by_name(object, "qwen3_batch_rows");
     map = bpf_object__find_map_by_name(object, "batch");
     rc = !program || !map ||
-         run_case(bpf_map__fd(map), bpf_program__fd(program), 4, 3072) ||
+         run_case(bpf_map__fd(map), bpf_program__fd(program),
+                  QWEN3_BATCH_ROWS, 3072) ||
          run_case(bpf_map__fd(map), bpf_program__fd(program), 1, 128);
     bpf_object__close(object);
     if (rc) {

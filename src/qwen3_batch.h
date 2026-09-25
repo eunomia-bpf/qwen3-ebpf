@@ -3,10 +3,10 @@
 
 #include <linux/types.h>
 
-#define QWEN3_BATCH_ROWS 4
+#define QWEN3_BATCH_ROWS 16
 #define QWEN3_BATCH_COLS 3072
 
-/* One map transfer and BPF invocation computes up to four complete rows. */
+/* One BPF invocation computes up to 16 complete rows. */
 struct qwen3_batch_work {
     __s32 input_q16[QWEN3_BATCH_COLS];
     __s32 weight_q24[QWEN3_BATCH_ROWS][QWEN3_BATCH_COLS];

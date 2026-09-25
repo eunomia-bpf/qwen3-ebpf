@@ -46,10 +46,12 @@ that kernel. RMSNorm weights use Q20 rather than Q24 because the official
 model contains weights above Q24's representable range.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
 eBPF, without a user-space lookup or per-input host computation.
-`src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
-and a standalone argmax operator in eBPF. In the complete inference path,
-the matrix callback also tracks the best vocabulary logit as it projects
-each row, avoiding a separate pass over the output vector.
+`src/qwen3_vector.bpf.c` implements residual addition and MLP gating
+multiply in eBPF. In the complete inference path, the matrix callback
+also tracks the best vocabulary logit as it projects each row, avoiding a
+separate pass over the output vector. Addition and multiplication process
+up to 3,072 elements per BPF invocation via bounded `bpf_loop` tiles and a
+memory-mapped work map.
 `src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
 `src/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
 softmax/V reduction for each prior position. It reads KV pairs from a
@@ -214,6 +216,14 @@ token `0`, `Hello, world!`, or `[0, 1] --generate 2`. Six interleaved
 3.380/3.074/3.116 s after; the syscall reduction is clear, but these
 samples do not establish a latency improvement.
 
+The residual-add and MLP-multiply operators now process a complete 1,024-
+or 3,072-element vector per invocation rather than making a map update,
+test-run, and lookup for every 128-element tile. On the same host, one-token
+`bpf` calls fell from 12,482 to 9,205. The 128- and 3,072-element operator
+tests passed, and token `0`, `Hello, world!`, and `[0, 1] --generate 2`
+retained byte-identical full-vocabulary logits. This establishes fewer
+syscalls, not a stable latency gain.
+
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
 An exhaustive conversion test checks representable finite patterns against
@@ -285,12 +295,13 @@ remove the dense matrix cost. C also loads BF16 tensors, converts each active
 row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
-`bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, and up to
-256 attention-history items per invocation. It does not turn a 28-layer model
-into one BPF invocation: matrix batches, normalization calls, and
-token-by-token generation still cross the user/kernel boundary. Bounded units
-keep verifier complexity and per-invocation runtime manageable. The attention
-smoke test crosses the 256-item boundary, but a full long-context model run
+`bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, up to
+24 vector tiles, and up to 256 attention-history items per invocation. It
+does not turn a 28-layer model into one BPF invocation: matrix batches,
+normalization calls, and token-by-token generation still cross the
+user/kernel boundary. Bounded units keep verifier complexity and
+per-invocation runtime manageable. The attention smoke test crosses the
+256-item boundary, but a full long-context model run
 has not been validated.
 
 The mmap-backed array is sufficient for the current shared working buffers;

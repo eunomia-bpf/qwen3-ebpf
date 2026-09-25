@@ -47,6 +47,9 @@ struct qwen3_engine {
     void *norm_mapping;
     size_t norm_mapping_len;
     struct qwen3_norm_state *norm_work;
+    void *vector_mapping;
+    size_t vector_mapping_len;
+    struct qwen3_vector_state *vector_work;
     void *attention_mapping;
     size_t attention_mapping_len;
     struct qwen3_attention_state *attention_work;
@@ -129,6 +132,8 @@ static void close_engine(struct qwen3_engine *engine)
         munmap(engine->batch_mapping, engine->batch_mapping_len);
     if (engine->norm_mapping)
         munmap(engine->norm_mapping, engine->norm_mapping_len);
+    if (engine->vector_mapping)
+        munmap(engine->vector_mapping, engine->vector_mapping_len);
     if (engine->attention_mapping)
         munmap(engine->attention_mapping, engine->attention_mapping_len);
     if (engine->kv_mapping)
@@ -149,7 +154,7 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
     static const char *norm_programs[] = {"qwen3_rms_full"};
     static const char *silu_programs[] = {"qwen3_silu_apply"};
     static const char *vector_programs[] = {
-        "qwen3_vector_add", "qwen3_vector_multiply", "qwen3_vector_argmax"
+        "qwen3_vector_add", "qwen3_vector_multiply"
     };
     static const char *rope_programs[] = {"qwen3_rope_apply"};
     static const char *attention_programs[] = {
@@ -166,7 +171,7 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         open_operator(&engine->silu, "build/qwen3_silu.bpf.o",
                       "silu", silu_programs, 1, 0) ||
         open_operator(&engine->vector, "build/qwen3_vector.bpf.o",
-                      "vector", vector_programs, 3, 0) ||
+                      "vector", vector_programs, 2, 0) ||
         open_operator(&engine->rope, "build/qwen3_rope.bpf.o",
                       "rope", rope_programs, 1, 0) ||
         open_operator(&engine->attention, "build/qwen3_attention.bpf.o",
@@ -179,17 +184,21 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         sizeof(struct qwen3_batch_work), &engine->batch_mapping_len);
     engine->norm_mapping = map_shared(engine->norm.map_fd,
         sizeof(struct qwen3_norm_state), &engine->norm_mapping_len);
+    engine->vector_mapping = map_shared(engine->vector.map_fd,
+        sizeof(struct qwen3_vector_state), &engine->vector_mapping_len);
     engine->attention_mapping = map_shared(engine->attention.map_fd,
         sizeof(struct qwen3_attention_state), &engine->attention_mapping_len);
     engine->kv_mapping = map_shared(bpf_map__fd(kv_map),
         (size_t)kv_slots * sizeof(struct qwen3_kv_pair),
         &engine->kv_mapping_len);
     if (!engine->batch_mapping || !engine->norm_mapping ||
+        !engine->vector_mapping ||
         !engine->attention_mapping ||
         !engine->kv_mapping)
         return -1;
     engine->batch_work = engine->batch_mapping;
     engine->norm_work = engine->norm_mapping;
+    engine->vector_work = engine->vector_mapping;
     engine->attention_work = engine->attention_mapping;
     engine->kv_pairs = engine->kv_mapping;
     return 0;
@@ -406,25 +415,19 @@ static int kernel_vector(struct qwen3_engine *engine, int multiply,
                          const int32_t *left, const int32_t *right,
                          int count, int32_t *output)
 {
-    struct qwen3_vector_state work = {0};
-    const uint32_t key = 0;
-    int tile, i;
+    struct qwen3_vector_state *work = engine->vector_work;
 
-    if (count % QWEN3_TILE_WIDTH)
+    if (count <= 0 || count > QWEN3_VECTOR_MAX ||
+        count % QWEN3_TILE_WIDTH)
         return -1;
-    for (tile = 0; tile < count / QWEN3_TILE_WIDTH; tile++) {
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            int index = tile * QWEN3_TILE_WIDTH + i;
-            work.left_q16[i] = left[index];
-            work.right_q16[i] = right[index];
-        }
-        if (bpf_map_update_elem(engine->vector.map_fd, &key, &work, BPF_ANY) ||
-            call_kernel(engine->vector.program_fd[multiply ? 1 : 0]) ||
-            bpf_map_lookup_elem(engine->vector.map_fd, &key, &work))
-            return -1;
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++)
-            output[tile * QWEN3_TILE_WIDTH + i] = work.output_q16[i];
-    }
+    memcpy(work->left_q16, left, (size_t)count * sizeof(*left));
+    memcpy(work->right_q16, right, (size_t)count * sizeof(*right));
+    work->count = (uint32_t)count;
+    work->completed_tiles = 0;
+    if (call_kernel(engine->vector.program_fd[multiply ? 1 : 0]) ||
+        work->completed_tiles != (uint32_t)(count / QWEN3_TILE_WIDTH))
+        return -1;
+    memcpy(output, work->output_q16, (size_t)count * sizeof(*output));
     return 0;
 }
 

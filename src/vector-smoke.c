@@ -1,4 +1,3 @@
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,7 +8,7 @@
 int main(int argc, char **argv)
 {
     struct bpf_object *obj;
-    struct bpf_program *add, *multiply, *argmax;
+    struct bpf_program *add, *multiply;
     struct bpf_map *map;
     struct qwen3_vector_state work = {0};
     const uint8_t packet[64] = {0};
@@ -37,9 +36,8 @@ int main(int argc, char **argv)
     }
     add = bpf_object__find_program_by_name(obj, "qwen3_vector_add");
     multiply = bpf_object__find_program_by_name(obj, "qwen3_vector_multiply");
-    argmax = bpf_object__find_program_by_name(obj, "qwen3_vector_argmax");
     map = bpf_object__find_map_by_name(obj, "vector");
-    if (!add || !multiply || !argmax || !map) {
+    if (!add || !multiply || !map) {
         fprintf(stderr, "BPF vector program or map missing\n");
         goto done;
     }
@@ -48,6 +46,7 @@ int main(int argc, char **argv)
         work.left_q16[i] = (i - 64) * 65536;
         work.right_q16[i] = (i % 7 - 3) * 32768;
     }
+    work.count = QWEN3_TILE_WIDTH;
     if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
         bpf_prog_test_run_opts(bpf_program__fd(add), &opts) ||
         bpf_map_lookup_elem(map_fd, &key, &work)) {
@@ -60,7 +59,9 @@ int main(int argc, char **argv)
             goto done;
         }
     }
-    if (bpf_prog_test_run_opts(bpf_program__fd(multiply), &opts) ||
+    work.completed_tiles = 0;
+    if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
+        bpf_prog_test_run_opts(bpf_program__fd(multiply), &opts) ||
         bpf_map_lookup_elem(map_fd, &key, &work)) {
         perror("BPF vector multiply");
         goto done;
@@ -73,19 +74,42 @@ int main(int argc, char **argv)
             goto done;
         }
     }
-    work.best_q16 = INT_MIN;
-    work.base_index = 256;
+    for (i = 0; i < QWEN3_VECTOR_MAX; i++) {
+        work.left_q16[i] = (i % 127 - 63) * 4096;
+        work.right_q16[i] = (i % 11 - 5) * 8192;
+    }
+    work.count = QWEN3_VECTOR_MAX;
+    work.completed_tiles = 0;
     if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
-        bpf_prog_test_run_opts(bpf_program__fd(argmax), &opts) ||
-        bpf_map_lookup_elem(map_fd, &key, &work)) {
-        perror("BPF vector argmax");
+        bpf_prog_test_run_opts(bpf_program__fd(add), &opts) ||
+        bpf_map_lookup_elem(map_fd, &key, &work) ||
+        work.completed_tiles != QWEN3_VECTOR_MAX / QWEN3_TILE_WIDTH) {
+        fprintf(stderr, "BPF full vector add failed\n");
         goto done;
     }
-    if (work.best_index != 383 || work.best_q16 != work.left_q16[127]) {
-        fprintf(stderr, "BPF vector argmax mismatch\n");
+    for (i = 0; i < QWEN3_VECTOR_MAX; i++) {
+        if (work.output_q16[i] != work.left_q16[i] + work.right_q16[i]) {
+            fprintf(stderr, "BPF full vector add mismatch at %d\n", i);
+            goto done;
+        }
+    }
+    work.completed_tiles = 0;
+    if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
+        bpf_prog_test_run_opts(bpf_program__fd(multiply), &opts) ||
+        bpf_map_lookup_elem(map_fd, &key, &work) ||
+        work.completed_tiles != QWEN3_VECTOR_MAX / QWEN3_TILE_WIDTH) {
+        fprintf(stderr, "BPF full vector multiply failed\n");
         goto done;
     }
-    printf("kernel vector add/multiply/argmax: 128 elements (matches C assertions)\n");
+    for (i = 0; i < QWEN3_VECTOR_MAX; i++) {
+        int32_t expected = (int32_t)(((int64_t)work.left_q16[i] *
+                                      work.right_q16[i]) >> 16);
+        if (work.output_q16[i] != expected) {
+            fprintf(stderr, "BPF full vector multiply mismatch at %d\n", i);
+            goto done;
+        }
+    }
+    printf("kernel vector add/multiply: 128 and 3072 elements (matches C assertions)\n");
     rc = 0;
 done:
     bpf_object__close(obj);

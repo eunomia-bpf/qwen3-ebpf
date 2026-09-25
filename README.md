@@ -36,6 +36,12 @@ matrix operator with packed nibbles and Q24 group scales. Its operator smoke
 test checks the BPF result against the same packed calculation in C; it is not
 used by the complete inference driver.
 
+`src/qwen3_int8.bpf.c` separately tests a 128-row, group-32 signed-INT8
+operator with Q32 group scales and fused argmax. Its synthetic and official
+model-row checks pass on the test kernel. The complete driver does not select
+it: the exploratory whole-model integration described below did not establish
+the required generation fidelity or speedup.
+
 `src/qwen3_arena_int4.bpf.c` is an optional arena-resident version of that
 operator: C writes 16 packed rows and their scales into a shared BPF arena,
 and the BPF matrix callbacks read weights directly from the arena instead of
@@ -392,6 +398,21 @@ BF16/Q24 vocabulary projection alone did not recover token `9` for input
 control with the same experimental driver returned `9`, so the mismatch was
 not caused merely by loading the extra BPF object. A calibrated or mixed-
 precision scheme needs full-model accuracy validation before integration.
+
+A separate group-32 INT8 experiment also passed the verifier and its
+128-row synthetic operator test. On one official Q-projection row, BF16, C
+INT8, and BPF INT8 dots were `0.125738472`, `0.125476453`, and
+`0.125473022`. A temporary full-model driver, not retained in `infer`,
+generated the same first IDs as Q24 for input tokens `0` and `1` (`9` and
+`14582`), but for the exact text `Hello, world!` it generated `20166`
+instead of Q24's `1096`. On that four-token prompt, measured end-to-end
+times were `8.027 s` for on-the-fly INT8 quantization and `3.310 s` for
+Q24 on the same host; the respective one-token `0` times were `2.630 s`
+and `1.183 s`. These are single runs, not a throughput benchmark. Keeping
+MLP matrices at Q24 still changed the four-token prompt's first ID to
+`20166`; using finer 16-weight INT8 groups did not establish fidelity.
+An INT8 format may be useful with calibration, better mixed precision, and
+reusable prepacking, but this experiment is not a drop-in replacement.
 
 This is a research prototype. It is not intended for production kernels or
 performance-sensitive traffic. The project code is MIT licensed; Qwen model

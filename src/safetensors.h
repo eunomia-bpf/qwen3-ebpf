@@ -3,10 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 struct safetensors_file {
-    FILE *stream;
+    const uint8_t *mapping;
+    size_t mapping_size;
     char *header;
     uint64_t header_length;
 };

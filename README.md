@@ -26,9 +26,10 @@ width. The original tile program remains an operator test. Full inference now
 uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to four complete matrix
 rows per invocation. Its 61 KiB work map is memory-mapped into C, so the
 driver writes weights and activations and reads results without per-batch map
-update/lookup syscalls. The weights still come from the BF16 model file and
-are converted to Q24 in C for each forward pass; this is not yet a resident
-quantized-weight or arena implementation.
+update/lookup syscalls. The BF16 model file is mapped read-only once, avoiding
+per-row file seeks, reads, and allocations; active rows are still converted to
+Q24 in C for each forward pass. This is not yet a resident quantized-weight
+or arena implementation.
 
 `src/qwen3_norm.bpf.c` implements RMSNorm as separate accumulate, finalize,
 and apply BPF programs. The split matters: a combined accumulation and
@@ -168,6 +169,14 @@ estimates, and the cache still uses a dense map allocation proportional to
 the requested context length. The kernel scans history in chunks rather
 than one unbounded invocation; large-context capacity and latency have not
 been validated.
+
+Mapping the BF16 model file read-only removed the repeated file I/O syscalls.
+In one-token `strace -c` runs, the earlier driver made 496,730 `lseek`,
+291,467 `read`, and 143,667 `bpf` calls; the mapped driver made 143,667
+`bpf` calls and only 20 `read` calls. A separate warm-cache one-token run
+measured 2.912 s before and 2.695 s after this change, with byte-identical
+full-vocabulary logits. These are individual observations, not a controlled
+benchmark or a speedup guarantee; many operator dispatches remain.
 
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean

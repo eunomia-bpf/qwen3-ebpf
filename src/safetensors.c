@@ -1,31 +1,47 @@
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "safetensors.h"
 
 int safetensors_open(struct safetensors_file *file, const char *path)
 {
-    uint8_t length_bytes[8];
+    struct stat st;
+    int fd;
     size_t i;
 
     if (!file || !path)
         return -1;
     memset(file, 0, sizeof(*file));
-    file->stream = fopen(path, "rb");
-    if (!file->stream ||
-        fread(length_bytes, 1, sizeof(length_bytes), file->stream) != sizeof(length_bytes))
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) || st.st_size < 8 ||
+        (uint64_t)st.st_size > SIZE_MAX) {
+        close(fd);
+        return -1;
+    }
+    file->mapping_size = (size_t)st.st_size;
+    file->mapping = mmap(NULL, file->mapping_size, PROT_READ, MAP_PRIVATE,
+                         fd, 0);
+    close(fd);
+    if (file->mapping == MAP_FAILED) {
+        file->mapping = NULL;
         goto fail;
+    }
     for (i = 0; i < 8; i++)
-        file->header_length |= (uint64_t)length_bytes[i] << (8 * i);
-    if (!file->header_length || file->header_length > 1024 * 1024)
+        file->header_length |= (uint64_t)file->mapping[i] << (8 * i);
+    if (!file->header_length || file->header_length > 1024 * 1024 ||
+        file->header_length > file->mapping_size - 8)
         goto fail;
     file->header = calloc((size_t)file->header_length + 1, 1);
-    if (!file->header ||
-        fread(file->header, 1, (size_t)file->header_length, file->stream) !=
-            file->header_length)
+    if (!file->header)
         goto fail;
+    memcpy(file->header, file->mapping + 8, (size_t)file->header_length);
     return 0;
 fail:
     safetensors_close(file);
@@ -36,8 +52,8 @@ void safetensors_close(struct safetensors_file *file)
 {
     if (!file)
         return;
-    if (file->stream)
-        fclose(file->stream);
+    if (file->mapping)
+        munmap((void *)file->mapping, file->mapping_size);
     free(file->header);
     memset(file, 0, sizeof(*file));
 }
@@ -73,26 +89,24 @@ int safetensors_read_bf16_at(struct safetensors_file *file,
                              uint64_t first_byte, uint64_t first,
                              size_t count, float *out)
 {
-    uint8_t *raw;
+    const uint8_t *raw;
+    size_t data_offset, payload_size;
     size_t i;
 
-    if (!file || !file->stream || !out || !count || count > SIZE_MAX / 2)
+    if (!file || !file->mapping || !out || !count || count > SIZE_MAX / 2)
         return -1;
-    raw = malloc(count * 2);
-    if (!raw)
+    data_offset = 8 + (size_t)file->header_length;
+    payload_size = file->mapping_size - data_offset;
+    if (first_byte > payload_size ||
+        first > (payload_size - (size_t)first_byte) / 2 ||
+        count > (payload_size - (size_t)first_byte) / 2 - (size_t)first)
         return -1;
-    if (fseeko(file->stream,
-               (off_t)(8 + file->header_length + first_byte + first * 2),
-               SEEK_SET) || fread(raw, 2, count, file->stream) != count) {
-        free(raw);
-        return -1;
-    }
+    raw = file->mapping + data_offset + (size_t)first_byte + (size_t)first * 2;
     for (i = 0; i < count; i++) {
         uint32_t bits = ((uint32_t)raw[2 * i] |
                          ((uint32_t)raw[2 * i + 1] << 8)) << 16;
         memcpy(&out[i], &bits, sizeof(bits));
     }
-    free(raw);
     return 0;
 }
 

@@ -126,7 +126,10 @@ driver combines it with the MLP gate and up projections.
 The 128-wide Q/K RMSNorm check passed with maximum absolute error `0.000597`;
 RoPE's test at positions 0, 1, 7, and 63 had maximum error `1.56e-05`.
 The online attention operator passed synthetic one-head tests with 1, 2, 4,
-8, and 16 positions; the worst maximum absolute error was `0.000905`.
+8, 16, and 257 positions; the worst maximum absolute error was `0.000905`.
+The 257-position case crosses a 256-item `bpf_loop` chunk boundary and matches
+the former one-KV-pair-per-invocation path byte for byte. It does not validate
+a full 257-token model forward pass.
 
 The full layer-0 V-projection matrix (1,024 rows, 1,048,576 MACs) then ran
 through the BPF matvec with official weights and deterministic activations.

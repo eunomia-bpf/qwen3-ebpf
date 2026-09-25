@@ -207,6 +207,35 @@ be extrapolated to arbitrary contexts. The user-space driver may load weights,
 tokenize, invoke BPF, and read output, but cannot
 substitute user-space model math for kernel forward computation.
 
+### Current boundary and limits
+
+The model's dense arithmetic, attention reduction, and argmax run in BPF.
+Tokenization and text decoding remain in C: the exact tokenizer loads a large
+JSON vocabulary, uses Oniguruma regex splitting and dynamic BPE data
+structures, and turns token IDs back into bytes. Moving that I/O path into
+verified BPF would require a separate bounded implementation and would not
+remove the dense matrix cost. C also loads BF16 tensors, converts each active
+row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
+These are real host-side responsibilities, not hidden kernel inference.
+
+`bpf_loop` now batches four matrix rows and up to 256 attention-history items
+per invocation. It does not turn a 28-layer model into one BPF invocation:
+matrix batches, normalization stages, and token-by-token generation still
+cross the user/kernel boundary. Bounded units keep verifier complexity and
+per-invocation runtime manageable. The attention smoke test crosses the
+256-item boundary, but a full long-context model run has not been validated.
+
+The mmap-backed array is sufficient for the current shared working buffers;
+an arena is not yet used for resident model weights. Arena allocation alone
+would not make 0.6B parameters fit cheaply or remove their conversion cost.
+The current KV layout reserves 1,024 bytes for each position/layer/KV-head
+pair, about 224 KiB per position and 8.75 GiB at 40,960 positions, before
+weights and other buffers. It may fail under real memory limits. Q24 is the
+current arithmetic quantization, converted from the official BF16 file each
+forward pass; a separately stored low-bit model and its whole-model accuracy
+and speed have not been tested. One Q8 row test showed substantial error, so
+the code does not advertise Q8 as a drop-in replacement.
+
 This is a research prototype. It is not intended for production kernels or
 performance-sensitive traffic. The project code is MIT licensed; Qwen model
 weights, if obtained separately, retain their own Apache-2.0 license.

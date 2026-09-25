@@ -52,7 +52,9 @@ also tracks the best vocabulary logit as it projects each row, avoiding a
 separate pass over the output vector. Addition and multiplication process
 up to 3,072 elements per BPF invocation via bounded `bpf_loop` tiles and a
 memory-mapped work map.
-`src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
+`src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF. A bounded
+`bpf_loop` processes all 16 query and eight key heads in one invocation per
+layer; C supplies their shared sine/cosine values once per layer.
 `src/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
 softmax/V reduction for each prior position. It reads KV pairs from a
 memory-mapped BPF map and traverses history in bounded `bpf_loop` chunks;
@@ -224,6 +226,15 @@ tests passed, and token `0`, `Hello, world!`, and `[0, 1] --generate 2`
 retained byte-identical full-vocabulary logits. This establishes fewer
 syscalls, not a stable latency gain.
 
+RoPE now batches all 24 query/key heads per layer in one BPF invocation,
+using a memory-mapped work map and one shared set of trigonometric inputs.
+One-token `bpf` calls fell from 9,205 to 7,217. Operator tests passed for
+one and 24 heads at positions 0, 1, 7, and 63; token `0`, `Hello, world!`,
+and `[0, 1] --generate 2` retained byte-identical full-vocabulary logits.
+Six interleaved `Hello, world!` runs measured 3.195/3.256/3.064 s before
+and 3.130/3.168/3.176 s after. The syscall reduction is clear, but the
+latency samples overlap.
+
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
 An exhaustive conversion test checks representable finite patterns against
@@ -296,10 +307,10 @@ row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
 `bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, up to
-24 vector tiles, and up to 256 attention-history items per invocation. It
-does not turn a 28-layer model into one BPF invocation: matrix batches,
-normalization calls, and token-by-token generation still cross the
-user/kernel boundary. Bounded units keep verifier complexity and
+24 vector tiles or RoPE heads, and up to 256 attention-history items per
+invocation. It does not turn a 28-layer model into one BPF invocation:
+matrix batches, normalization calls, and token-by-token generation still
+cross the user/kernel boundary. Bounded units keep verifier complexity and
 per-invocation runtime manageable. The attention smoke test crosses the
 256-item boundary, but a full long-context model run
 has not been validated.

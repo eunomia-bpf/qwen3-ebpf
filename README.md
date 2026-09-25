@@ -250,18 +250,25 @@ The current KV layout reserves 1,024 bytes for each position/layer/KV-head
 pair, about 224 KiB per position and 8.75 GiB at 40,960 positions, before
 weights and other buffers. It may fail under real memory limits. Q24 is the
 current arithmetic quantization, converted from the official BF16 file each
-forward pass; a separately stored low-bit model and its whole-model accuracy
-and speed have not been tested. One Q8 row test showed substantial error, so
-the code does not advertise Q8 as a drop-in replacement.
+forward pass. One Q8 row test showed substantial error, so the code does not
+advertise Q8 as a drop-in replacement.
 Two exploratory variants were not retained. Converting BF16 to Q24 inside
 the 3,072-column BPF loop failed verifier loading on the test kernel with
 `The sequence of 8193 jumps is too complex`. Per-row scaled int16 weights
 loaded and kept the same top token for input `0`, but the 151,936 logits had
 mean absolute difference `0.00517` from the Q24 path, while two warm-cache
 single-token runs took 3.30 s and 3.17 s versus 1.61 s for the Q24 path.
-These are exploratory measurements, not a claim that prepacked low-bit
-weights would also be slower; a reusable quantized representation has not
-been implemented.
+These are exploratory measurements. A separate self-contained Safetensors
+variant preconverting all rank-2 BF16 tensors to I32 Q24 was also tested and
+not retained. Its one-token logits matched the existing path byte for byte,
+but its file grew from 1,503,300,328 to 3,006,434,093 bytes. Interleaved
+same-host runs on input `0` took 5.18/3.93 s with the preconverted file
+versus 3.22/2.37 s with the original BF16 file. The host had only about
+4.6 GiB available memory during this test, so file size and cache pressure
+may explain part of the regression; no isolated cause or general speed claim
+is established. Conversion itself took about 8 s. This tests prepacked Q24,
+not an efficient lower-bit representation; a reusable, smaller quantized
+weight layout with whole-model accuracy and speed evidence remains open.
 
 This is a research prototype. It is not intended for production kernels or
 performance-sensitive traffic. The project code is MIT licensed; Qwen model

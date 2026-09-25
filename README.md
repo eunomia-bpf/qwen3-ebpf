@@ -54,6 +54,15 @@ read, not whole-model weight residency, acceptable INT4 generation quality,
 or a speedup. It is not in the default `make test` or inference path because
 the latter still uses the portable, more accurate Q24 path.
 
+`src/qwen3_arena_bf16.bpf.c` tests a different exact-weight route: it keeps
+raw BF16 matrix rows and a 65,536-entry BF16-to-Q24 lookup table in the
+arena. BPF reads a BF16 value, obtains the same Q24 integer used by the
+default driver, and computes the dot product without C converting or copying
+Q24 weights for that invocation. On the test kernel, all 16 synthetic rows
+and 16 official Q-projection rows matched the C Q24 reference exactly. The
+test occupies only a bounded arena region; it does not show that all model
+weights can reside there or that the complete driver is faster.
+
 `src/qwen3_norm.bpf.c` implements RMSNorm in one BPF invocation. Two bounded
 `bpf_loop` callbacks accumulate and apply up to eight 128-element tiles around
 the integer-square-root step. Its work map is memory-mapped, so C can supply
@@ -96,8 +105,9 @@ make test-tokenizer TOKENIZER=/path/to/tokenizer.json
 ```
 
 If Clang 19, libbpf with arena support, and bpftool are available, the
-separate arena operator check is `make test-arena-int4
-MODEL=/path/to/model.safetensors`. Without `MODEL`, it runs the synthetic
+separate arena operator checks are `make test-arena-int4` and
+`make test-arena-bf16`, each optionally with
+`MODEL=/path/to/model.safetensors`. Without `MODEL`, each runs the synthetic
 check only. `ARENA_LIBBPF_INCLUDE`, `ARENA_UAPI_INCLUDE`, and
 `ARENA_LIBBPF` can point to an external recent libbpf build; the normal
 build does not need these dependencies.
@@ -383,9 +393,11 @@ has not been validated.
 
 Mmap-backed arrays are sufficient for the current inference working buffers;
 the KV cache is a separate BPF array written by the attention program. Only
-the optional 16-row INT4 operator reads arena-resident weights;
-the full model does not. Arena allocation alone would not make 0.6B
-parameters fit cheaply or remove their conversion cost.
+the optional INT4 and BF16 lookup operators read arena-resident weights;
+the full model does not. The BF16 lookup path preserves Q24 integer weights
+without storing them as four-byte values, but full-model arena residency,
+memory pressure, and speed remain untested. Arena allocation alone would
+not make 0.6B parameters fit cheaply or remove their conversion cost.
 The current KV layout reserves 1,024 bytes for each position/layer/KV-head
 pair, about 224 KiB per position and 8.75 GiB at 40,960 positions, before
 weights and other buffers. It may fail under real memory limits. Q24 is the

@@ -47,6 +47,9 @@ struct qwen3_engine {
     void *norm_mapping;
     size_t norm_mapping_len;
     struct qwen3_norm_state *norm_work;
+    void *silu_mapping;
+    size_t silu_mapping_len;
+    struct qwen3_silu_state *silu_work;
     void *vector_mapping;
     size_t vector_mapping_len;
     struct qwen3_vector_state *vector_work;
@@ -135,6 +138,8 @@ static void close_engine(struct qwen3_engine *engine)
         munmap(engine->batch_mapping, engine->batch_mapping_len);
     if (engine->norm_mapping)
         munmap(engine->norm_mapping, engine->norm_mapping_len);
+    if (engine->silu_mapping)
+        munmap(engine->silu_mapping, engine->silu_mapping_len);
     if (engine->vector_mapping)
         munmap(engine->vector_mapping, engine->vector_mapping_len);
     if (engine->rope_mapping)
@@ -189,6 +194,8 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         sizeof(struct qwen3_batch_work), &engine->batch_mapping_len);
     engine->norm_mapping = map_shared(engine->norm.map_fd,
         sizeof(struct qwen3_norm_state), &engine->norm_mapping_len);
+    engine->silu_mapping = map_shared(engine->silu.map_fd,
+        sizeof(struct qwen3_silu_state), &engine->silu_mapping_len);
     engine->vector_mapping = map_shared(engine->vector.map_fd,
         sizeof(struct qwen3_vector_state), &engine->vector_mapping_len);
     engine->rope_mapping = map_shared(engine->rope.map_fd,
@@ -199,12 +206,14 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         (size_t)kv_slots * sizeof(struct qwen3_kv_pair),
         &engine->kv_mapping_len);
     if (!engine->batch_mapping || !engine->norm_mapping ||
+        !engine->silu_mapping ||
         !engine->vector_mapping || !engine->rope_mapping ||
         !engine->attention_mapping ||
         !engine->kv_mapping)
         return -1;
     engine->batch_work = engine->batch_mapping;
     engine->norm_work = engine->norm_mapping;
+    engine->silu_work = engine->silu_mapping;
     engine->vector_work = engine->vector_mapping;
     engine->rope_work = engine->rope_mapping;
     engine->attention_work = engine->attention_mapping;
@@ -406,22 +415,18 @@ done:
 static int kernel_silu(struct qwen3_engine *engine, const int32_t *input,
                        int count, int32_t *output)
 {
-    struct qwen3_silu_state work = {0};
-    const uint32_t key = 0;
-    int tile, i;
+    struct qwen3_silu_state *work = engine->silu_work;
 
-    if (count % QWEN3_TILE_WIDTH)
+    if (count <= 0 || count > QWEN3_SILU_MAX ||
+        count % QWEN3_TILE_WIDTH)
         return -1;
-    for (tile = 0; tile < count / QWEN3_TILE_WIDTH; tile++) {
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++)
-            work.input_q16[i] = input[tile * QWEN3_TILE_WIDTH + i];
-        if (bpf_map_update_elem(engine->silu.map_fd, &key, &work, BPF_ANY) ||
-            call_kernel(engine->silu.program_fd[0]) ||
-            bpf_map_lookup_elem(engine->silu.map_fd, &key, &work))
-            return -1;
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++)
-            output[tile * QWEN3_TILE_WIDTH + i] = work.output_q16[i];
-    }
+    memcpy(work->input_q16, input, (size_t)count * sizeof(*input));
+    work->count = (uint32_t)count;
+    work->completed_tiles = 0;
+    if (call_kernel(engine->silu.program_fd[0]) ||
+        work->completed_tiles != (uint32_t)(count / QWEN3_TILE_WIDTH))
+        return -1;
+    memcpy(output, work->output_q16, (size_t)count * sizeof(*output));
     return 0;
 }
 

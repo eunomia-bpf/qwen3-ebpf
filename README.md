@@ -45,7 +45,9 @@ processing budget on the test kernel; the callback-based version passed on
 that kernel. RMSNorm weights use Q20 rather than Q24 because the official
 model contains weights above Q24's representable range.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
-eBPF, without a user-space lookup or per-input host computation.
+eBPF, without a user-space lookup or per-input host computation. It now
+handles the complete 3,072-element MLP gate in one `bpf_loop` invocation
+through a memory-mapped work map.
 `src/qwen3_vector.bpf.c` implements residual addition and MLP gating
 multiply in eBPF. In the complete inference path, the matrix callback
 also tracks the best vocabulary logit as it projects each row, avoiding a
@@ -133,8 +135,8 @@ The layer-0 input RMSNorm check with its actual BF16 scale weights passed on
 the same kernel, with maximum absolute error `7.4e-05` across 1,024 elements
 against a C floating-point reference for a deterministic input vector. This
 is a one-vector operator test, not a complete-layer accuracy guarantee.
-The SiLU check passed with maximum absolute error `0.000634` across 1,024
-inputs in `[-8, 8]` against a C floating-point reference. The inference
+The SiLU check passed with maximum absolute error `0.000634` across 128 and
+3,072 inputs in `[-8, 8]` against a C floating-point reference. The inference
 driver combines it with the MLP gate and up projections.
 The 128-wide Q/K RMSNorm check passed with maximum absolute error `0.000597`;
 RoPE's test at positions 0, 1, 7, and 63 had maximum error `1.56e-05`.
@@ -235,6 +237,14 @@ Six interleaved `Hello, world!` runs measured 3.195/3.256/3.064 s before
 and 3.130/3.168/3.176 s after. The syscall reduction is clear, but the
 latency samples overlap.
 
+SiLU now computes all 24 MLP tiles in one BPF invocation instead of making
+one map update, test-run, and lookup per tile. The 128- and 3,072-element
+operator checks passed on the same kernel. Token `0` and `Hello, world!`
+retained byte-identical full-vocabulary logits, and `[0, 1] --generate 2`
+still produced IDs `220, 16`. One-token `bpf` calls fell from 7,217 to
+5,229. This is a measured syscall reduction, not a controlled wall-clock
+speedup claim.
+
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
 An exhaustive conversion test checks representable finite patterns against
@@ -307,7 +317,7 @@ row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
 `bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, up to
-24 vector tiles or RoPE heads, and up to 256 attention-history items per
+24 vector or SiLU tiles or RoPE heads, and up to 256 attention-history items per
 invocation. It does not turn a 28-layer model into one BPF invocation:
 matrix batches, normalization calls, and token-by-token generation still
 cross the user/kernel boundary. Bounded units keep verifier complexity and

@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "qwen3_silu.h"
@@ -11,7 +13,7 @@ int main(int argc, char **argv)
     struct bpf_object *obj;
     struct bpf_program *prog;
     struct bpf_map *map;
-    struct qwen3_silu_state work = {0};
+    struct qwen3_silu_state *work;
     const uint8_t packet[64] = {0};
     struct bpf_test_run_opts opts = {
         .sz = sizeof(opts),
@@ -19,9 +21,11 @@ int main(int argc, char **argv)
         .data_size_in = sizeof(packet),
         .repeat = 1,
     };
-    const uint32_t key = 0;
     double max_error = 0;
-    int map_fd, prog_fd, tile_index, i, rc = 1;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t length = ((sizeof(*work) + page - 1) / page) * page;
+    const int counts[] = {QWEN3_TILE_WIDTH, QWEN3_SILU_MAX};
+    int map_fd, prog_fd, count, case_index, i, rc = 1;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s build/qwen3_silu.bpf.o\n", argv[0]);
@@ -44,31 +48,38 @@ int main(int argc, char **argv)
     }
     prog_fd = bpf_program__fd(prog);
     map_fd = bpf_map__fd(map);
-    for (tile_index = 0; tile_index < QWEN3_HIDDEN_TILES; tile_index++) {
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            int index = tile_index * QWEN3_TILE_WIDTH + i;
-            work.input_q16[i] = ((index % 257) - 128) * 4096;
-        }
-        if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
-            bpf_prog_test_run_opts(prog_fd, &opts) ||
-            bpf_map_lookup_elem(map_fd, &key, &work)) {
+    work = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0);
+    if (work == MAP_FAILED) {
+        perror("BPF SiLU mmap");
+        goto done;
+    }
+    for (case_index = 0; case_index < 2; case_index++) {
+        count = counts[case_index];
+        for (i = 0; i < count; i++)
+            work->input_q16[i] = ((i % 257) - 128) * 4096;
+        work->count = (uint32_t)count;
+        work->completed_tiles = 0;
+        if (bpf_prog_test_run_opts(prog_fd, &opts) ||
+            work->completed_tiles != (uint32_t)(count / QWEN3_TILE_WIDTH)) {
             perror("BPF SiLU");
-            goto done;
+            goto unmap;
         }
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            double x = work.input_q16[i] / 65536.0;
+        for (i = 0; i < count; i++) {
+            double x = work->input_q16[i] / 65536.0;
             double reference = x / (1.0 + exp(-x));
-            double error = fabs(work.output_q16[i] / 65536.0 - reference);
+            double error = fabs(work->output_q16[i] / 65536.0 - reference);
             if (error > max_error)
                 max_error = error;
         }
     }
-    printf("kernel SiLU: 1024 inputs in [-8,8], max_abs_error=%.9g\n", max_error);
+    printf("kernel SiLU: 128 and 3072 inputs in [-8,8], max_abs_error=%.9g\n", max_error);
     if (max_error > 0.005) {
         fprintf(stderr, "kernel SiLU exceeds one-vector error budget\n");
-        goto done;
+        goto unmap;
     }
     rc = 0;
+unmap:
+    munmap(work, length);
 done:
     bpf_object__close(obj);
     return rc;

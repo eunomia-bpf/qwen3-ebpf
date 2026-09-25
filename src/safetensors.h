@@ -19,6 +19,9 @@ int safetensors_find_bf16(const struct safetensors_file *file,
 int safetensors_read_bf16_at(struct safetensors_file *file,
                              uint64_t first_byte, uint64_t first,
                              size_t count, float *out);
+int safetensors_read_bf16_q24_at(struct safetensors_file *file,
+                                 uint64_t first_byte, uint64_t first,
+                                 size_t count, int32_t *out);
 
 /* Read a contiguous BF16 slice from a named tensor into host floats. */
 int safetensors_read_bf16(const char *path, const char *tensor,

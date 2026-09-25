@@ -187,6 +187,18 @@ single measured 1.626 s did not establish a further benefit; the smaller
 earlier byte-identical logits for `Hello, world!` and `[0, 1] --generate 2`.
 These timings are exploratory, not a controlled performance distribution.
 
+Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
+its Q24 value once per process, then converts active matrix rows by lookup.
+An exhaustive conversion test checks representable finite patterns against
+the previous floating-point formula and rejects non-finite or out-of-range
+values. Three interleaved one-token runs on the same host measured
+1.425/1.576/1.476 s for the previous conversion and 1.154/1.258/1.049 s
+for the lookup path. The latter produced byte-identical full-vocabulary Q16
+logits for token `0`, `Hello, world!`, and `[0, 1] --generate 2`. These are
+small exploratory samples, not a stable throughput or cross-host speed claim.
+The lookup table occupies about 512 KiB; weight conversion still happens in C
+for each active matrix row, not in BPF or in a resident weight arena.
+
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean
 absolute error was `0.024` and RMSE `0.030`; the top three token IDs agreed.

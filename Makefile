@@ -5,7 +5,7 @@ ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
 
 .PHONY: all test test-model test-tokenizer clean
 
-all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_batch.bpf.o build/batch-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/qwen3_rope.bpf.o build/rope-smoke build/qwen3_attention.bpf.o build/attention-smoke build/infer
+all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_batch.bpf.o build/batch-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/qwen3_rope.bpf.o build/rope-smoke build/qwen3_attention.bpf.o build/attention-smoke build/infer build/safetensors-smoke
 
 build:
 	mkdir -p build
@@ -61,7 +61,11 @@ build/tokenizer-smoke: src/tokenizer-smoke.c src/qwen3_tokenizer.c src/qwen3_tok
 build/infer: src/infer.c src/safetensors.c src/safetensors.h src/qwen3_tokenizer.c src/qwen3_tokenizer.h src/qwen3_tile.h src/qwen3_batch.h src/qwen3_norm.h src/qwen3_silu.h src/qwen3_vector.h src/qwen3_rope.h src/qwen3_attention.h | build
 	$(CC) $(CFLAGS) -Isrc src/infer.c src/safetensors.c src/qwen3_tokenizer.c -o $@ -lbpf -lelf -lz -lm -ljson-c -lonig
 
+build/safetensors-smoke: src/safetensors-smoke.c src/safetensors.c src/safetensors.h | build
+	$(CC) $(CFLAGS) -Isrc src/safetensors-smoke.c src/safetensors.c -o $@ -lm
+
 test: all
+	./build/safetensors-smoke
 	./build/matvec-smoke build/qwen3_matvec.bpf.o
 	./build/batch-smoke build/qwen3_batch.bpf.o
 	./build/silu-smoke build/qwen3_silu.bpf.o

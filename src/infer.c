@@ -197,15 +197,6 @@ static int convert_q16(float value, int32_t *out)
     return 0;
 }
 
-static int convert_q24(float value, int32_t *out)
-{
-    double scaled = (double)value * 16777216.0;
-    if (scaled > INT32_MAX || scaled < INT32_MIN)
-        return -1;
-    *out = (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
-    return 0;
-}
-
 static int convert_q20(float value, int32_t *out)
 {
     double scaled = (double)value * 1048576.0;
@@ -349,7 +340,6 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
                          int repeat_v, int32_t *output)
 {
     uint64_t first_byte, elements;
-    float *weights;
     struct qwen3_batch_work *work = engine->batch_work;
     int row, batch_row, i, rc = -1;
 
@@ -361,9 +351,6 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
         fprintf(stderr, "matrix metadata mismatch for %s\n", name);
         return -1;
     }
-    weights = malloc((size_t)cols * sizeof(*weights));
-    if (!weights)
-        return -1;
     work->cols = (uint32_t)cols;
     for (i = 0; i < cols; i++)
         work->input_q16[i] = input[repeat_v
@@ -375,20 +362,13 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
             ? rows - row : QWEN3_BATCH_ROWS);
         work->completed = 0;
         for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
-            if (safetensors_read_bf16_at(&engine->model, first_byte,
+            if (safetensors_read_bf16_q24_at(&engine->model, first_byte,
                     (uint64_t)(row + batch_row) * cols,
-                    (size_t)cols, weights)) {
-                fprintf(stderr, "matrix read failed for %s row %d\n",
+                    (size_t)cols, work->weight_q24[batch_row])) {
+                fprintf(stderr, "matrix Q24 read failed for %s row %d\n",
                         name, row + batch_row);
                 goto done;
             }
-            for (i = 0; i < cols; i++)
-                if (convert_q24(weights[i],
-                                &work->weight_q24[batch_row][i])) {
-                    fprintf(stderr, "matrix Q24 conversion failed for %s row %d col %d value %.9g\n",
-                            name, row + batch_row, i, weights[i]);
-                    goto done;
-                }
         }
         if (call_kernel(engine->batch.program_fd[0])) {
             perror("BPF matrix batch");
@@ -406,7 +386,6 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
     }
     rc = 0;
 done:
-    free(weights);
     return rc;
 }
 

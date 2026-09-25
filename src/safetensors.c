@@ -1,4 +1,7 @@
 #include <fcntl.h>
+#include <limits.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +109,57 @@ int safetensors_read_bf16_at(struct safetensors_file *file,
         uint32_t bits = ((uint32_t)raw[2 * i] |
                          ((uint32_t)raw[2 * i + 1] << 8)) << 16;
         memcpy(&out[i], &bits, sizeof(bits));
+    }
+    return 0;
+}
+
+int safetensors_read_bf16_q24_at(struct safetensors_file *file,
+                                 uint64_t first_byte, uint64_t first,
+                                 size_t count, int32_t *out)
+{
+    static int64_t q24_by_bf16[UINT16_MAX + 1];
+    static atomic_int lookup_state = ATOMIC_VAR_INIT(0);
+    const uint8_t *raw;
+    size_t data_offset, payload_size, i;
+
+    if (!file || !file->mapping || !out || !count || count > SIZE_MAX / 2)
+        return -1;
+    data_offset = 8 + (size_t)file->header_length;
+    payload_size = file->mapping_size - data_offset;
+    if (first_byte > payload_size ||
+        first > (payload_size - (size_t)first_byte) / 2 ||
+        count > (payload_size - (size_t)first_byte) / 2 - (size_t)first)
+        return -1;
+    raw = file->mapping + data_offset + (size_t)first_byte + (size_t)first * 2;
+    if (atomic_load_explicit(&lookup_state, memory_order_acquire) != 2) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&lookup_state, &expected,
+                1, memory_order_acq_rel, memory_order_acquire)) {
+            uint32_t bits;
+            for (bits = 0; bits <= UINT16_MAX; bits++) {
+                uint32_t float_bits = bits << 16;
+                float value;
+                double scaled;
+                memcpy(&value, &float_bits, sizeof(value));
+                scaled = (double)value * 16777216.0;
+                q24_by_bf16[bits] = !isfinite(scaled) ||
+                    scaled > INT32_MAX || scaled < INT32_MIN
+                    ? INT64_MIN
+                    : (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+            }
+            atomic_store_explicit(&lookup_state, 2, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&lookup_state, memory_order_acquire) != 2)
+                ;
+        }
+    }
+    for (i = 0; i < count; i++) {
+        uint16_t bits = (uint16_t)raw[2 * i] |
+                        (uint16_t)raw[2 * i + 1] << 8;
+        int64_t value = q24_by_bf16[bits];
+        if (value == INT64_MIN)
+            return -1;
+        out[i] = (int32_t)value;
     }
     return 0;
 }

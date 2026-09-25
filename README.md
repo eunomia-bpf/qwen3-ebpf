@@ -23,13 +23,13 @@ separate inference driver below connects all decoder layers.
 The same BPF program also accepts a caller-supplied tile count; `make test`
 now checks a 3,072-element path (24 tiles), matching Qwen3's MLP intermediate
 width. The original tile program remains an operator test. Full inference now
-uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to 16 complete matrix
-rows per invocation. Its 204 KiB work map is memory-mapped into C, so the
-driver writes weights and activations and reads results without per-batch map
-update/lookup syscalls. The BF16 model file is mapped read-only once, avoiding
-per-row file seeks, reads, and allocations; active rows are still converted to
-Q24 in C for each forward pass. This is not yet a resident quantized-weight
-or arena implementation.
+uses `src/qwen3_batch.bpf.c`: `bpf_loop` computes up to 128 complete matrix
+rows per invocation. Its approximately 1.51 MiB work map is memory-mapped
+into C, so the driver writes weights and activations and reads results without
+per-batch map update/lookup syscalls. The BF16 model file is mapped read-only
+once, avoiding per-row file seeks, reads, and allocations; active rows are
+still converted to Q24 in C for each forward pass. This is not yet a resident
+quantized-weight or arena implementation.
 
 `src/qwen3_int4.bpf.c` separately tests a 16-row, group-128 signed-INT4
 matrix operator with packed nibbles and Q24 group scales. Its operator smoke
@@ -188,10 +188,21 @@ Increasing the matrix batch from 4 to 16 rows reduced one-token `bpf`
 syscalls from 143,667 to 50,667 in the same test container. Individual
 one-token runs measured 2.695 s at 4 rows and 1.605 s at 16 rows. An
 experimental 32-row version loaded and returned identical logits, but its
-single measured 1.626 s did not establish a further benefit; the smaller
-16-row work map is retained. The final 16-row path also reproduced the
-earlier byte-identical logits for `Hello, world!` and `[0, 1] --generate 2`.
+single measured 1.626 s did not establish a further benefit at that point.
+The 16-row path also reproduced the earlier byte-identical logits for
+`Hello, world!` and `[0, 1] --generate 2`.
 These timings are exploratory, not a controlled performance distribution.
+
+On 2026-09-25, larger `bpf_loop` batches were tested on the same host with
+the accurate Q24 path. The 128-row version loaded, passed the matrix smoke
+test, and produced byte-identical full-vocabulary logits to 16 and 256 rows
+for `Hello, world!` and `[0, 1] --generate 2`; the latter also generated the
+same two token IDs. One-token `bpf` calls fell from 43,168 at 16 rows to
+16,043 at 128 rows. Interleaved `Hello, world!` timings were 3.624/3.733 s
+at 16 rows and 3.276/3.208 s at 128 rows. Additional interleaved 128- and
+256-row timings overlapped, so 128 rows is retained with roughly half the
+work-map size of 256 rows. These are small, noisy same-host samples, not a
+general throughput claim; the one-token timing did not show a stable gain.
 
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
@@ -264,7 +275,7 @@ remove the dense matrix cost. C also loads BF16 tensors, converts each active
 row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
-`bpf_loop` now batches 16 matrix rows, up to eight RMSNorm tiles, and up to
+`bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, and up to
 256 attention-history items per invocation. It does not turn a 28-layer model
 into one BPF invocation: matrix batches, normalization calls, and
 token-by-token generation still cross the user/kernel boundary. Bounded units

@@ -350,6 +350,7 @@ static int kernel_matrix(struct qwen3_engine *engine, const char *name,
     for (row = 0; row < rows; row += QWEN3_BATCH_ROWS) {
         work->rows = (uint32_t)(rows - row < QWEN3_BATCH_ROWS
             ? rows - row : QWEN3_BATCH_ROWS);
+        work->base_index = (uint32_t)row;
         work->completed = 0;
         for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
             if (safetensors_read_bf16_q24_at(&engine->model, first_byte,
@@ -424,27 +425,6 @@ static int kernel_vector(struct qwen3_engine *engine, int multiply,
         for (i = 0; i < QWEN3_TILE_WIDTH; i++)
             output[tile * QWEN3_TILE_WIDTH + i] = work.output_q16[i];
     }
-    return 0;
-}
-
-static int kernel_argmax(struct qwen3_engine *engine, const int32_t *logits,
-                         uint32_t *best_id, int32_t *best_logit)
-{
-    struct qwen3_vector_state work = {.best_q16 = INT32_MIN};
-    const uint32_t key = 0;
-    int tile, i;
-
-    for (tile = 0; tile < QWEN3_VOCAB / QWEN3_TILE_WIDTH; tile++) {
-        work.base_index = tile * QWEN3_TILE_WIDTH;
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++)
-            work.left_q16[i] = logits[work.base_index + i];
-        if (bpf_map_update_elem(engine->vector.map_fd, &key, &work, BPF_ANY) ||
-            call_kernel(engine->vector.program_fd[2]) ||
-            bpf_map_lookup_elem(engine->vector.map_fd, &key, &work))
-            return -1;
-    }
-    *best_id = work.best_index;
-    *best_logit = work.best_q16;
     return 0;
 }
 
@@ -698,15 +678,20 @@ int main(int argc, char **argv)
         }
         if (position < token_count - 1)
             continue;
+        engine.batch_work->track_argmax = 1;
+        engine.batch_work->best_q16 = INT32_MIN;
+        engine.batch_work->best_index = 0;
         if (kernel_norm(&engine, "model.norm.weight", hidden,
                     QWEN3_HIDDEN_SIZE, normed) ||
             kernel_matrix(&engine, "model.embed_tokens.weight",
                       QWEN3_VOCAB, QWEN3_HIDDEN_SIZE,
-                      normed, 0, logits) ||
-            kernel_argmax(&engine, logits, &next_id, &best_logit)) {
+                      normed, 0, logits)) {
             fprintf(stderr, "final norm, vocabulary projection or argmax failed\n");
             goto done;
         }
+        next_id = engine.batch_work->best_index;
+        best_logit = (int32_t)engine.batch_work->best_q16;
+        engine.batch_work->track_argmax = 0;
         if (dump_path) {
         FILE *dump = fopen(dump_path, "wb");
         size_t written;

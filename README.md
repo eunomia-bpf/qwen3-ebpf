@@ -47,7 +47,9 @@ model contains weights above Q24's representable range.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
 eBPF, without a user-space lookup or per-input host computation.
 `src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
-and output-logit argmax in eBPF. The host only supplies and retrieves tiles.
+and a standalone argmax operator in eBPF. In the complete inference path,
+the matrix callback also tracks the best vocabulary logit as it projects
+each row, avoiding a separate pass over the output vector.
 `src/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF, and
 `src/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
 softmax/V reduction for each prior position. It reads KV pairs from a
@@ -203,6 +205,14 @@ at 16 rows and 3.276/3.208 s at 128 rows. Additional interleaved 128- and
 256-row timings overlapped, so 128 rows is retained with roughly half the
 work-map size of 256 rows. These are small, noisy same-host samples, not a
 general throughput claim; the one-token timing did not show a stable gain.
+
+The vocabulary projection now accumulates argmax inside the same BPF matrix
+callbacks. On the same host, this reduced one-token `bpf` calls from 16,043
+to 12,482 without changing any full-vocabulary logits or generated IDs for
+token `0`, `Hello, world!`, or `[0, 1] --generate 2`. Six interleaved
+`Hello, world!` runs measured 3.029/3.184/3.212 s before and
+3.380/3.074/3.116 s after; the syscall reduction is clear, but these
+samples do not establish a latency improvement.
 
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.

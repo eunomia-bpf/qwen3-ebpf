@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,8 @@ static int run_case(int map_fd, int program_fd, int rows, int cols)
     void *mapping = mmap(NULL, length, PROT_READ | PROT_WRITE,
                          MAP_SHARED, map_fd, 0);
     struct qwen3_batch_work *work;
-    int row, col, rc = -1;
+    int row, col, best_row = 0, rc = -1;
+    int64_t best = INT32_MIN;
 
     if (mapping == MAP_FAILED) {
         int mmap_errno = errno;
@@ -39,6 +41,9 @@ static int run_case(int map_fd, int program_fd, int rows, int cols)
     memset(work, 0, sizeof(*work));
     work->rows = rows;
     work->cols = cols;
+    work->track_argmax = 1;
+    work->base_index = 256;
+    work->best_q16 = INT32_MIN;
     for (col = 0; col < cols; col++)
         work->input_q16[col] = ((col % 11) - 5) * 8192;
     for (row = 0; row < rows; row++)
@@ -64,6 +69,22 @@ static int run_case(int map_fd, int program_fd, int rows, int cols)
                     (long long)(expected >> 24));
             goto done;
         }
+        if (work->output_q16[row] > best) {
+            best = work->output_q16[row];
+            best_row = row;
+        }
+    }
+    if (work->best_q16 != best || work->best_index != (uint32_t)(256 + best_row)) {
+        fprintf(stderr, "batch argmax mismatch\n");
+        goto done;
+    }
+    work->completed = 0;
+    work->base_index += (uint32_t)rows;
+    if (bpf_prog_test_run_opts(program_fd, &opts) ||
+        work->completed != (uint32_t)rows ||
+        work->best_q16 != best || work->best_index != (uint32_t)(256 + best_row)) {
+        fprintf(stderr, "batch argmax tie across batches failed\n");
+        goto done;
     }
     rc = 0;
 done:

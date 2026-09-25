@@ -28,6 +28,10 @@ static long compute_row(__u32 row, void *ctx)
         sum += (__s64)work->input_q16[i] * work->weight_q24[bounded_row][i];
     }
     work->output_q16[bounded_row] = sum >> 24;
+    if (work->track_argmax && work->output_q16[bounded_row] > work->best_q16) {
+        work->best_q16 = work->output_q16[bounded_row];
+        work->best_index = work->base_index + row;
+    }
     work->completed++;
     return 0;
 }

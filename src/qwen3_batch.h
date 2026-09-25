@@ -14,6 +14,10 @@ struct qwen3_batch_work {
     __u32 rows;
     __u32 cols;
     __u32 completed;
+    __u32 track_argmax;
+    __u32 base_index;
+    __u32 best_index;
+    __s64 best_q16;
 };
 
 #endif

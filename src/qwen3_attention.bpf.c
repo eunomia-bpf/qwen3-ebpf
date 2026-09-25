@@ -20,7 +20,6 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(map_flags, BPF_F_MMAPABLE);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct qwen3_kv_pair);
@@ -183,6 +182,35 @@ static long cached_all_heads_step(__u32 index, void *ctx)
     return 0;
 }
 
+static long store_current_kv(__u32 index, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_attention_heads_state *work =
+        bpf_map_lookup_elem(&attention_heads, &key);
+    struct qwen3_kv_pair *pair;
+    __u32 bounded_index = index & (QWEN3_KV_HEADS - 1);
+    __u32 slot;
+    int i;
+
+    (void)ctx;
+    if (!work || index >= QWEN3_KV_HEADS ||
+        work->current_position >= QWEN3_ATTENTION_CONTEXT_LIMIT ||
+        work->layer >= QWEN3_ATTENTION_LAYERS)
+        return 1;
+    slot = (work->current_position * QWEN3_ATTENTION_LAYERS + work->layer) *
+           QWEN3_ATTENTION_KV_HEADS + bounded_index;
+    pair = bpf_map_lookup_elem(&kv, &slot);
+    if (!pair)
+        return 1;
+#pragma clang loop unroll(disable)
+    for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
+        pair->key_q16[i] = work->current_kv[bounded_index].key_q16[i];
+        pair->value_q16[i] = work->current_kv[bounded_index].value_q16[i];
+    }
+    work->stored_kv++;
+    return 0;
+}
+
 SEC("socket")
 int qwen3_attention_all_heads(struct __sk_buff *skb)
 {
@@ -196,6 +224,12 @@ int qwen3_attention_all_heads(struct __sk_buff *skb)
         work->step_count > QWEN3_ATTENTION_CHUNK ||
         work->base_position > QWEN3_ATTENTION_CONTEXT_LIMIT - work->step_count)
         return 0;
+    if (work->store_kv && !work->completed_positions) {
+        work->stored_kv = 0;
+        bpf_loop(QWEN3_KV_HEADS, store_current_kv, &callback_ctx, 0);
+        if (work->stored_kv != QWEN3_KV_HEADS)
+            return 0;
+    }
     bpf_loop(work->step_count, cached_all_heads_step, &callback_ctx, 0);
     return 0;
 }

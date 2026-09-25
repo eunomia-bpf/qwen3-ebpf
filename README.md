@@ -4,9 +4,9 @@ An experimental C/libbpf implementation of Qwen3-0.6B forward
 computation in Linux eBPF. The current milestone runs **all 28 decoder layers
 for multi-token contexts**, projects to the full vocabulary, and produces the
 next token ID in the kernel. Greedy decoding can reuse the cache to produce
-additional token IDs. The KV cache is shared through a memory-mapped BPF map;
-the attention operator scans up to 256 prior positions per BPF invocation
-using `bpf_loop`.
+additional token IDs. The KV cache lives in a BPF array map; the attention
+operator writes new K/V pairs and scans up to 256 prior positions per
+invocation using `bpf_loop`.
 The host loads and quantizes official BF16 weights, dispatches bounded
 BPF tiles, and reads results; model arithmetic and argmax run in eBPF. A C
 ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
@@ -76,9 +76,9 @@ memory-mapped work map.
 `bpf_loop` processes all 16 query and eight key heads in one invocation per
 layer; C supplies their shared sine/cosine values once per layer.
 `src/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
-softmax/V reduction for each prior position. It reads KV pairs from a
-memory-mapped BPF map and traverses history in bounded `bpf_loop` chunks;
-C writes each newly generated K/V pair directly to that map. `src/infer.c`
+softmax/V reduction for each prior position. It writes new K/V pairs into a
+BPF map, then traverses its history in bounded `bpf_loop` chunks; C supplies
+the new K/V vectors through the attention work map. `src/infer.c`
 composes these operators with all model
 tensors, including Q/K projection, QK normalization, RoPE, causal attention,
 and grouped-query head sharing. The KV map is sized to the requested input
@@ -199,7 +199,7 @@ kernel runs byte for byte. Each duration is a single run, not a throughput
 distribution or proof of a general speedup. The inference workload remains
 far slower than conventional optimized model inference.
 
-With the mmap-backed KV cache and batched attention path, a further same-host
+With the then-mmap-backed KV cache and batched attention path, a same-host
 single run measured 2.790 s for input token `0` and 7.502 s for
 `Hello, world!`. The `[0, 1]` two-token generation run took 5.736 s.
 Their full-vocabulary logits matched the preceding kernel implementation
@@ -281,15 +281,24 @@ before and 1.221/1.138/1.209 s after. The calls fell, but these timings
 do not establish a latency gain.
 
 Cached attention now processes all 16 query heads in one BPF invocation per
-256-position chunk, reading the same memory-mapped KV array as before and
-reusing each KV lookup for its two query heads. An
-operator check across all heads and 257 positions matched the per-head BPF
-path element for element. Token `0`, `Hello, world!`, and two-token generation
+256-position chunk, reading the same BPF KV array as before and reusing
+each KV lookup for its two query heads. An operator check across all heads
+and 257 positions matched the per-head BPF path element for element. Token
+`0`, `Hello, world!`, and two-token generation
 retained byte-identical full-vocabulary logits. One-token `bpf` calls fell
 from 4,587 to 4,169 across the two builds; the new object adds two setup
 calls, while the execution path saves 15 calls per layer, or 420 per token.
 Three warm one-token runs of the new path took 1.186/1.017/1.016 s; these
 small, non-interleaved samples do not establish a latency improvement.
+
+The attention program now stores each newly projected K/V pair in the BPF
+KV array before scanning history. The host supplies the new vectors through
+the small attention work map but no longer maps or writes the cache directly.
+An eight-KV-head operator test verified the stored values and the same-call
+attention output; token `0`, `Hello, world!`, and two-token generation kept
+byte-identical full-vocabulary logits. The one-token `bpf` call count stayed
+at 4,169. This moves cache maintenance into BPF, not the whole scheduling
+loop, and has not established a latency gain.
 
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
@@ -372,8 +381,9 @@ per-invocation runtime manageable. The attention smoke test crosses the
 256-item boundary, but a full long-context model run
 has not been validated.
 
-The mmap-backed array is sufficient for the current inference working
-buffers. Only the optional 16-row INT4 operator reads arena-resident weights;
+Mmap-backed arrays are sufficient for the current inference working buffers;
+the KV cache is a separate BPF array written by the attention program. Only
+the optional 16-row INT4 operator reads arena-resident weights;
 the full model does not. Arena allocation alone would not make 0.6B
 parameters fit cheaply or remove their conversion cost.
 The current KV layout reserves 1,024 bytes for each position/layer/KV-head

@@ -211,6 +211,42 @@ int main(int argc, char **argv)
         }
     }
     puts("batched attention: 16 heads and 257 positions match per-head BPF");
+    memset(heads, 0, sizeof(*heads));
+    heads->store_kv = 1;
+    heads->current_position = QWEN3_ATTENTION_CHUNK;
+    heads->base_position = QWEN3_ATTENTION_CHUNK;
+    heads->step_count = 1;
+    for (kv_head = 0; kv_head < QWEN3_KV_HEADS; kv_head++) {
+        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
+            heads->current_kv[kv_head].key_q16[i] =
+                ((i + kv_head) % 17 - 8) * 8192;
+            heads->current_kv[kv_head].value_q16[i] =
+                (kv_head * 13 + i % 7) * 4096;
+        }
+    }
+    if (bpf_map_update_elem(all_heads_map_fd, &key, heads, BPF_ANY) ||
+        bpf_prog_test_run_opts(all_heads_fd, &opts) ||
+        bpf_map_lookup_elem(all_heads_map_fd, &key, heads) ||
+        heads->stored_kv != QWEN3_KV_HEADS ||
+        heads->completed_positions != 1)
+        goto done;
+    for (kv_head = 0; kv_head < QWEN3_KV_HEADS; kv_head++) {
+        uint32_t slot = (uint32_t)QWEN3_ATTENTION_CHUNK *
+                        QWEN3_ATTENTION_LAYERS * QWEN3_ATTENTION_KV_HEADS +
+                        (uint32_t)kv_head;
+        if (bpf_map_lookup_elem(kv_fd, &slot, &pair) ||
+            memcmp(&pair, &heads->current_kv[kv_head], sizeof(pair))) {
+            fprintf(stderr, "kernel KV write differs at head %d\n", kv_head);
+            goto done;
+        }
+        for (head = kv_head * 2; head < kv_head * 2 + 2; head++) {
+            if (heads->heads[head].seen != 1 ||
+                memcmp(heads->heads[head].output_q16, pair.value_q16,
+                       sizeof(pair.value_q16)))
+                goto done;
+        }
+    }
+    puts("kernel KV write: eight heads stored and consumed exactly");
     rc = 0;
 done:
     free(heads);

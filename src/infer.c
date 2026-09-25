@@ -61,20 +61,12 @@ struct qwen3_engine {
     void *attention_heads_mapping;
     size_t attention_heads_mapping_len;
     struct qwen3_attention_heads_state *attention_heads_work;
-    void *kv_mapping;
-    size_t kv_mapping_len;
-    struct qwen3_kv_pair *kv_pairs;
     struct kernel_operator norm;
     struct kernel_operator silu;
     struct kernel_operator vector;
     struct kernel_operator rope;
     struct kernel_operator attention;
 };
-
-static size_t cache_offset(int position, int layer, int head)
-{
-    return ((size_t)position * QWEN3_LAYERS + layer) * QWEN3_KV_HEADS + head;
-}
 
 static int call_kernel(int fd)
 {
@@ -151,8 +143,6 @@ static void close_engine(struct qwen3_engine *engine)
     if (engine->attention_heads_mapping)
         munmap(engine->attention_heads_mapping,
                engine->attention_heads_mapping_len);
-    if (engine->kv_mapping)
-        munmap(engine->kv_mapping, engine->kv_mapping_len);
     bpf_object__close(engine->batch.object);
     bpf_object__close(engine->norm.object);
     bpf_object__close(engine->silu.object);
@@ -176,7 +166,6 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         "qwen3_attention_step", "qwen3_attention_cached",
         "qwen3_attention_all_heads"
     };
-    struct bpf_map *kv_map;
     struct bpf_map *qk_norm_map;
     struct bpf_program *qk_norm_program;
     uint32_t kv_slots = (uint32_t)total_positions * QWEN3_LAYERS * QWEN3_KV_HEADS;
@@ -195,11 +184,10 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         open_operator(&engine->attention, "build/qwen3_attention.bpf.o",
                       "attention_heads", attention_programs, 3, kv_slots))
         return -1;
-    kv_map = bpf_object__find_map_by_name(engine->attention.object, "kv");
     qk_norm_map = bpf_object__find_map_by_name(engine->norm.object, "qk_norm");
     qk_norm_program = bpf_object__find_program_by_name(
         engine->norm.object, "qwen3_qk_norm_heads");
-    if (!kv_map || !qk_norm_map || !qk_norm_program)
+    if (!qk_norm_map || !qk_norm_program)
         return -1;
     engine->qk_norm_program_fd = bpf_program__fd(qk_norm_program);
     engine->batch_mapping = map_shared(engine->batch.map_fd,
@@ -217,15 +205,11 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
     engine->attention_heads_mapping = map_shared(engine->attention.map_fd,
         sizeof(struct qwen3_attention_heads_state),
         &engine->attention_heads_mapping_len);
-    engine->kv_mapping = map_shared(bpf_map__fd(kv_map),
-        (size_t)kv_slots * sizeof(struct qwen3_kv_pair),
-        &engine->kv_mapping_len);
     if (!engine->batch_mapping || !engine->norm_mapping ||
         !engine->qk_norm_mapping ||
         !engine->silu_mapping ||
         !engine->vector_mapping || !engine->rope_mapping ||
-        !engine->attention_heads_mapping ||
-        !engine->kv_mapping)
+        !engine->attention_heads_mapping)
         return -1;
     engine->batch_work = engine->batch_mapping;
     engine->norm_work = engine->norm_mapping;
@@ -234,7 +218,6 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
     engine->vector_work = engine->vector_mapping;
     engine->rope_work = engine->rope_mapping;
     engine->attention_heads_work = engine->attention_heads_mapping;
-    engine->kv_pairs = engine->kv_mapping;
     return 0;
 }
 
@@ -389,7 +372,9 @@ static int kernel_rope(struct qwen3_engine *engine, int32_t *query,
 
 static int kernel_attention_heads(struct qwen3_engine *engine,
                                   int layer, int position,
-                                  const int32_t *query, int32_t *output)
+                                  const int32_t *query,
+                                  const int32_t *key_vectors,
+                                  const int32_t *values, int32_t *output)
 {
     struct qwen3_attention_heads_state *work = engine->attention_heads_work;
     int start, head;
@@ -399,13 +384,24 @@ static int kernel_attention_heads(struct qwen3_engine *engine,
         memcpy(work->heads[head].query_q16,
                query + head * QWEN3_TILE_WIDTH,
                sizeof(work->heads[head].query_q16));
+    for (head = 0; head < QWEN3_KV_HEADS; head++) {
+        memcpy(work->current_kv[head].key_q16,
+               key_vectors + head * QWEN3_TILE_WIDTH,
+               sizeof(work->current_kv[head].key_q16));
+        memcpy(work->current_kv[head].value_q16,
+               values + head * QWEN3_TILE_WIDTH,
+               sizeof(work->current_kv[head].value_q16));
+    }
     work->layer = (uint32_t)layer;
+    work->current_position = (uint32_t)position;
+    work->store_kv = 1;
     for (start = 0; start <= position; start += QWEN3_ATTENTION_CHUNK) {
         work->base_position = (uint32_t)start;
         work->step_count = (uint32_t)(position + 1 - start < QWEN3_ATTENTION_CHUNK
             ? position + 1 - start : QWEN3_ATTENTION_CHUNK);
         if (call_kernel(engine->attention.program_fd[2]) ||
-            work->completed_positions != (uint32_t)(start + work->step_count))
+            work->completed_positions != (uint32_t)(start + work->step_count) ||
+            work->stored_kv != QWEN3_KV_HEADS)
             return -1;
     }
     for (head = 0; head < QWEN3_Q_HEADS; head++) {
@@ -552,7 +548,7 @@ int main(int argc, char **argv)
     const char *dump_path = NULL;
     FILE *report = stdout;
     int32_t best_logit = 0;
-    int layer, position, head, token_count = 0, generate_count = 1;
+    int layer, position, token_count = 0, generate_count = 1;
     int total_positions, emitted_count = 0, last_processed = -1;
     int arg, rc = 1;
 
@@ -673,15 +669,8 @@ int main(int argc, char **argv)
             goto layer_fail;
         if (kernel_rope(&engine, query, key_vectors, position))
             goto layer_fail;
-        for (head = 0; head < QWEN3_KV_HEADS; head++) {
-            struct qwen3_kv_pair *pair = engine.kv_pairs +
-                cache_offset(position, layer, head);
-            memcpy(pair->key_q16, key_vectors + head * QWEN3_TILE_WIDTH,
-                   sizeof(pair->key_q16));
-            memcpy(pair->value_q16, v + head * QWEN3_TILE_WIDTH,
-                   sizeof(pair->value_q16));
-        }
-        if (kernel_attention_heads(&engine, layer, position, query, attended))
+        if (kernel_attention_heads(&engine, layer, position, query,
+                                   key_vectors, v, attended))
             goto layer_fail;
         snprintf(name, sizeof(name),
                  "model.layers.%d.self_attn.o_proj.weight", layer);

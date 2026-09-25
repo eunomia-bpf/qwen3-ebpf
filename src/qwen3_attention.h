@@ -31,10 +31,14 @@ struct qwen3_attention_state {
 
 struct qwen3_attention_heads_state {
     struct qwen3_attention_state heads[QWEN3_Q_HEADS];
+    struct qwen3_kv_pair current_kv[QWEN3_KV_HEADS];
     __u32 layer;
+    __u32 current_position;
     __u32 base_position;
     __u32 step_count;
     __u32 completed_positions;
+    __u32 store_kv;
+    __u32 stored_kv;
 };
 
 #endif

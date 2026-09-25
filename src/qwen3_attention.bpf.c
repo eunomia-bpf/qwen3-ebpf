@@ -15,6 +15,14 @@ struct {
     __uint(map_flags, BPF_F_MMAPABLE);
     __uint(max_entries, 1);
     __type(key, __u32);
+    __type(value, struct qwen3_attention_heads_state);
+} attention_heads SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, 1);
+    __type(key, __u32);
     __type(value, struct qwen3_kv_pair);
 } kv SEC(".maps");
 
@@ -137,6 +145,58 @@ int qwen3_attention_cached(struct __sk_buff *skb)
         work->base_position > QWEN3_ATTENTION_CONTEXT_LIMIT - work->step_count)
         return 0;
     bpf_loop(work->step_count, cached_step, &callback_ctx, 0);
+    return 0;
+}
+
+static long cached_all_heads_step(__u32 index, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_attention_heads_state *work =
+        bpf_map_lookup_elem(&attention_heads, &key);
+    struct qwen3_kv_pair *pair;
+    __u32 past, slot;
+    int kv_head;
+
+    (void)ctx;
+    if (!work || index >= QWEN3_ATTENTION_CHUNK ||
+        index >= work->step_count)
+        return 1;
+    past = work->base_position + index;
+    if (past >= QWEN3_ATTENTION_CONTEXT_LIMIT ||
+        work->layer >= QWEN3_ATTENTION_LAYERS)
+        return 1;
+#pragma clang loop unroll(disable)
+    for (kv_head = 0; kv_head < QWEN3_ATTENTION_KV_HEADS; kv_head++) {
+        __u32 bounded_kv_head = (__u32)kv_head &
+                               (QWEN3_ATTENTION_KV_HEADS - 1);
+        slot = (past * QWEN3_ATTENTION_LAYERS + work->layer) *
+               QWEN3_ATTENTION_KV_HEADS + bounded_kv_head;
+        pair = bpf_map_lookup_elem(&kv, &slot);
+        if (!pair)
+            return 1;
+        attention_accumulate(&work->heads[bounded_kv_head * 2],
+                             pair->key_q16, pair->value_q16);
+        attention_accumulate(&work->heads[bounded_kv_head * 2 + 1],
+                             pair->key_q16, pair->value_q16);
+    }
+    work->completed_positions++;
+    return 0;
+}
+
+SEC("socket")
+int qwen3_attention_all_heads(struct __sk_buff *skb)
+{
+    const __u32 key = 0;
+    struct qwen3_attention_heads_state *work =
+        bpf_map_lookup_elem(&attention_heads, &key);
+    __u32 callback_ctx = 0;
+
+    (void)skb;
+    if (!work || !work->step_count ||
+        work->step_count > QWEN3_ATTENTION_CHUNK ||
+        work->base_position > QWEN3_ATTENTION_CONTEXT_LIMIT - work->step_count)
+        return 0;
+    bpf_loop(work->step_count, cached_all_heads_step, &callback_ctx, 0);
     return 0;
 }
 

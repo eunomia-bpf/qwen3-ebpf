@@ -280,6 +280,17 @@ layers. Three interleaved warm one-token runs took 1.204/1.242/1.199 s
 before and 1.221/1.138/1.209 s after. The calls fell, but these timings
 do not establish a latency gain.
 
+Cached attention now processes all 16 query heads in one BPF invocation per
+256-position chunk, reading the same memory-mapped KV array as before and
+reusing each KV lookup for its two query heads. An
+operator check across all heads and 257 positions matched the per-head BPF
+path element for element. Token `0`, `Hello, world!`, and two-token generation
+retained byte-identical full-vocabulary logits. One-token `bpf` calls fell
+from 4,587 to 4,169 across the two builds; the new object adds two setup
+calls, while the execution path saves 15 calls per layer, or 420 per token.
+Three warm one-token runs of the new path took 1.186/1.017/1.016 s; these
+small, non-interleaved samples do not establish a latency improvement.
+
 Weight preparation now maps each of the 65,536 possible BF16 bit patterns to
 its Q24 value once per process, then converts active matrix rows by lookup.
 An exhaustive conversion test checks representable finite patterns against
@@ -353,8 +364,8 @@ These are real host-side responsibilities, not hidden kernel inference.
 
 `bpf_loop` now batches 128 matrix rows, up to eight RMSNorm tiles, all 24 Q/K
 normalization heads, up to 24 vector or SiLU tiles or RoPE heads, and up to
-256 attention-history items per invocation. It does not turn a 28-layer model
-into one BPF invocation:
+256 attention-history items across all query heads per invocation. It does
+not turn a 28-layer model into one BPF invocation:
 matrix batches, normalization calls, and token-by-token generation still
 cross the user/kernel boundary. Bounded units keep verifier complexity and
 per-invocation runtime manageable. The attention smoke test crosses the

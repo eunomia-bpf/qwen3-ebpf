@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -11,8 +12,11 @@ int main(int argc, char **argv)
     struct bpf_object *obj;
     struct bpf_program *step;
     struct bpf_program *cached;
-    struct bpf_map *map, *kv_map;
+    struct bpf_program *all_heads;
+    struct bpf_map *map, *kv_map, *all_heads_map;
     struct qwen3_attention_state work = {0};
+    struct qwen3_attention_heads_state *heads = NULL;
+    int32_t *expected_heads = NULL;
     struct qwen3_kv_pair pair = {0};
     const uint8_t packet[64] = {0};
     struct bpf_test_run_opts opts = {
@@ -26,7 +30,8 @@ int main(int argc, char **argv)
     double scores[QWEN3_ATTENTION_CHUNK + 1] = {0};
     double values[QWEN3_ATTENTION_CHUNK + 1][QWEN3_TILE_WIDTH] = {{0}};
     double max_error = 0;
-    int step_fd, cached_fd, map_fd, kv_fd, token, i, length, case_index, rc = 1;
+    int step_fd, cached_fd, map_fd, kv_fd, token, i, length, case_index;
+    int head, kv_head, all_heads_fd, all_heads_map_fd, start, rc = 1;
 
     if (argc != 2) {
         fprintf(stderr, "usage: %s build/qwen3_attention.bpf.o\n", argv[0]);
@@ -48,14 +53,18 @@ int main(int argc, char **argv)
     }
     step = bpf_object__find_program_by_name(obj, "qwen3_attention_step");
     cached = bpf_object__find_program_by_name(obj, "qwen3_attention_cached");
+    all_heads = bpf_object__find_program_by_name(obj, "qwen3_attention_all_heads");
     map = bpf_object__find_map_by_name(obj, "attention");
-    if (!step || !cached || !map) {
+    all_heads_map = bpf_object__find_map_by_name(obj, "attention_heads");
+    if (!step || !cached || !all_heads || !map || !all_heads_map) {
         fprintf(stderr, "BPF attention program or map missing\n");
         goto done;
     }
     step_fd = bpf_program__fd(step);
     cached_fd = bpf_program__fd(cached);
+    all_heads_fd = bpf_program__fd(all_heads);
     map_fd = bpf_map__fd(map);
+    all_heads_map_fd = bpf_map__fd(all_heads_map);
     kv_fd = bpf_map__fd(kv_map);
     for (i = 0; i < QWEN3_TILE_WIDTH; i++)
         work.query_q16[i] = ((i * 7) % 31 - 15) * 32768;
@@ -142,8 +151,70 @@ int main(int argc, char **argv)
             }
         }
     }
+    heads = calloc(1, sizeof(*heads));
+    expected_heads = calloc(QWEN3_Q_HEADS * QWEN3_TILE_WIDTH,
+                            sizeof(*expected_heads));
+    if (!heads || !expected_heads)
+        goto done;
+    length = QWEN3_ATTENTION_CHUNK + 1;
+    for (token = 0; token < length; token++) {
+        for (kv_head = 0; kv_head < QWEN3_KV_HEADS; kv_head++) {
+            uint32_t slot = (uint32_t)token * QWEN3_ATTENTION_LAYERS *
+                            QWEN3_ATTENTION_KV_HEADS + kv_head;
+            for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
+                pair.key_q16[i] =
+                    ((i * (token + 3) + kv_head * 7) % 29 - 14) * 16384;
+                pair.value_q16[i] =
+                    ((i * (token + 5) + kv_head * 11) % 23 - 11) * 8192;
+            }
+            if (bpf_map_update_elem(kv_fd, &slot, &pair, BPF_ANY))
+                goto done;
+        }
+    }
+    for (head = 0; head < QWEN3_Q_HEADS; head++) {
+        memset(&work, 0, sizeof(work));
+        work.kv_head = (uint32_t)(head / 2);
+        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
+            work.query_q16[i] = ((i * 7 + head * 3) % 31 - 15) * 32768;
+            heads->heads[head].query_q16[i] = work.query_q16[i];
+        }
+        for (start = 0; start < length; start += QWEN3_ATTENTION_CHUNK) {
+            work.base_position = (uint32_t)start;
+            work.step_count = (uint32_t)(length - start < QWEN3_ATTENTION_CHUNK
+                ? length - start : QWEN3_ATTENTION_CHUNK);
+            if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
+                bpf_prog_test_run_opts(cached_fd, &opts) ||
+                bpf_map_lookup_elem(map_fd, &key, &work) ||
+                work.seen != (uint32_t)(start + work.step_count))
+                goto done;
+        }
+        memcpy(expected_heads + head * QWEN3_TILE_WIDTH,
+               work.output_q16, sizeof(work.output_q16));
+    }
+    for (start = 0; start < length; start += QWEN3_ATTENTION_CHUNK) {
+        heads->base_position = (uint32_t)start;
+        heads->step_count = (uint32_t)(length - start < QWEN3_ATTENTION_CHUNK
+            ? length - start : QWEN3_ATTENTION_CHUNK);
+        if (bpf_map_update_elem(all_heads_map_fd, &key, heads, BPF_ANY) ||
+            bpf_prog_test_run_opts(all_heads_fd, &opts) ||
+            bpf_map_lookup_elem(all_heads_map_fd, &key, heads) ||
+            heads->completed_positions != (uint32_t)(start + heads->step_count))
+            goto done;
+    }
+    for (head = 0; head < QWEN3_Q_HEADS; head++) {
+        if (heads->heads[head].seen != (uint32_t)length ||
+            memcmp(heads->heads[head].output_q16,
+                   expected_heads + head * QWEN3_TILE_WIDTH,
+                   sizeof(heads->heads[head].output_q16))) {
+            fprintf(stderr, "batched attention differs at head %d\n", head);
+            goto done;
+        }
+    }
+    puts("batched attention: 16 heads and 257 positions match per-head BPF");
     rc = 0;
 done:
+    free(heads);
+    free(expected_heads);
     bpf_object__close(obj);
     return rc;
 }

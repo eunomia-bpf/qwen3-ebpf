@@ -29,4 +29,12 @@ struct qwen3_attention_state {
     __u32 step_count;
 };
 
+struct qwen3_attention_heads_state {
+    struct qwen3_attention_state heads[QWEN3_Q_HEADS];
+    __u32 layer;
+    __u32 base_position;
+    __u32 step_count;
+    __u32 completed_positions;
+};
+
 #endif

@@ -5,7 +5,7 @@ ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
 
 .PHONY: all test test-model test-tokenizer clean
 
-all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_batch.bpf.o build/batch-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/qwen3_rope.bpf.o build/rope-smoke build/qwen3_attention.bpf.o build/attention-smoke build/infer build/safetensors-smoke
+all: build/qwen3_matvec.bpf.o build/matvec-smoke build/matrix-smoke build/qwen3_batch.bpf.o build/batch-smoke build/qwen3_int4.bpf.o build/int4-smoke build/qwen3_norm.bpf.o build/norm-smoke build/qwen3_silu.bpf.o build/silu-smoke build/qwen3_vector.bpf.o build/vector-smoke build/qwen3_rope.bpf.o build/rope-smoke build/qwen3_attention.bpf.o build/attention-smoke build/infer build/safetensors-smoke
 
 build:
 	mkdir -p build
@@ -18,6 +18,12 @@ build/qwen3_batch.bpf.o: src/qwen3_batch.bpf.c src/qwen3_batch.h | build
 
 build/batch-smoke: src/batch-smoke.c src/qwen3_batch.h | build
 	$(CC) $(CFLAGS) -Isrc src/batch-smoke.c -o $@ -lbpf -lelf -lz
+
+build/qwen3_int4.bpf.o: src/qwen3_int4.bpf.c src/qwen3_int4.h | build
+	$(CLANG) -O2 -g -target bpf -I$(ARCH_INCLUDE) -Isrc -c $< -o $@
+
+build/int4-smoke: src/int4-smoke.c src/qwen3_int4.h src/safetensors.c src/safetensors.h | build
+	$(CC) $(CFLAGS) -Isrc src/int4-smoke.c src/safetensors.c -o $@ -lbpf -lelf -lz -lm
 
 build/qwen3_norm.bpf.o: src/qwen3_norm.bpf.c src/qwen3_norm.h src/qwen3_tile.h | build
 	$(CLANG) -O2 -g -target bpf -I$(ARCH_INCLUDE) -Isrc -c $< -o $@
@@ -68,6 +74,7 @@ test: all
 	./build/safetensors-smoke
 	./build/matvec-smoke build/qwen3_matvec.bpf.o
 	./build/batch-smoke build/qwen3_batch.bpf.o
+	./build/int4-smoke build/qwen3_int4.bpf.o
 	./build/silu-smoke build/qwen3_silu.bpf.o
 	./build/vector-smoke build/qwen3_vector.bpf.o
 	./build/rope-smoke build/qwen3_rope.bpf.o
@@ -76,6 +83,7 @@ test: all
 test-model: all
 	test -n "$(MODEL)"
 	./build/matvec-smoke build/qwen3_matvec.bpf.o "$(MODEL)" --q24
+	./build/int4-smoke build/qwen3_int4.bpf.o "$(MODEL)"
 	./build/norm-smoke build/qwen3_norm.bpf.o "$(MODEL)"
 
 test-tokenizer: build/tokenizer-smoke

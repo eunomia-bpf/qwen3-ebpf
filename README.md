@@ -31,6 +31,11 @@ per-row file seeks, reads, and allocations; active rows are still converted to
 Q24 in C for each forward pass. This is not yet a resident quantized-weight
 or arena implementation.
 
+`src/qwen3_int4.bpf.c` separately tests a 16-row, group-128 signed-INT4
+matrix operator with packed nibbles and Q24 group scales. Its operator smoke
+test checks the BPF result against the same packed calculation in C; it is not
+used by the complete inference driver.
+
 `src/qwen3_norm.bpf.c` implements RMSNorm in one BPF invocation. Two bounded
 `bpf_loop` callbacks accumulate and apply up to eight 128-element tiles around
 the integer-square-root step. Its work map is memory-mapped, so C can supply
@@ -293,6 +298,27 @@ may explain part of the regression; no isolated cause or general speed claim
 is established. Conversion itself took about 8 s. This tests prepacked Q24,
 not an efficient lower-bit representation; a reusable, smaller quantized
 weight layout with whole-model accuracy and speed evidence remains open.
+
+A further exploratory full-model INT4 path was tested and not retained as an
+inference option. It prepacked the matrices used by the driver into
+316,616,704 bytes of signed 4-bit weights plus group-128 Q24 scales, taking
+1.928 s in one run before forward timing started. The INT4 BPF operator
+passed the verifier and synthetic and real-weight row smoke checks; on one
+official Q-projection row, the deterministic BF16 dot was `0.125738472`,
+the quantized C dot `0.119238757`, and BPF `0.119232178`. However, the
+complete model's first generated IDs changed for inputs `0`, `1`, and
+`[9707, 11, 1879, 0]`: the Q24 path returned `9`, `14582`, and `1096`,
+while this naive INT4 path returned `284`, `284`, and `21927`. Full-vocabulary
+logit MAE versus Q24 was `1.837`, `1.396`, and `0.981`, respectively. The
+corresponding single-run forward times were `0.956/0.995/3.197 s` for INT4
+versus `1.243/1.229/3.546 s` for Q24, excluding INT4 prepacking. These
+small samples show a possible kernel forward-speed benefit, not a usable
+quantized model or end-to-end speedup. Group-32 scales and retaining the
+BF16/Q24 vocabulary projection alone did not recover token `9` for input
+`0`; quantizing only MLP matrices still changed it to `284`. A no-INT4
+control with the same experimental driver returned `9`, so the mismatch was
+not caused merely by loading the extra BPF object. A calibrated or mixed-
+precision scheme needs full-model accuracy validation before integration.
 
 This is a research prototype. It is not intended for production kernels or
 performance-sensitive traffic. The project code is MIT licensed; Qwen model

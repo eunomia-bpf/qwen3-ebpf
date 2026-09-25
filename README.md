@@ -31,13 +31,14 @@ per-row file seeks, reads, and allocations; active rows are still converted to
 Q24 in C for each forward pass. This is not yet a resident quantized-weight
 or arena implementation.
 
-`src/qwen3_norm.bpf.c` implements RMSNorm as separate accumulate, finalize,
-and apply BPF programs. The split matters: a combined accumulation and
-branching integer-square-root program exceeded the verifier's one-million
-instruction processing budget on the test kernel. The finalized version keeps
-the RMS computation in eBPF while bounding each verification unit. RMSNorm
-weights use Q20 rather than Q24 because the official model contains weights
-above Q24's representable range.
+`src/qwen3_norm.bpf.c` implements RMSNorm in one BPF invocation. Two bounded
+`bpf_loop` callbacks accumulate and apply up to eight 128-element tiles around
+the integer-square-root step. Its work map is memory-mapped, so C can supply
+the full vector and read the result without per-tile map syscalls. An earlier
+monolithic implementation exceeded the verifier's one-million-instruction
+processing budget on the test kernel; the callback-based version passed on
+that kernel. RMSNorm weights use Q20 rather than Q24 because the official
+model contains weights above Q24's representable range.
 `src/qwen3_silu.bpf.c` approximates SiLU entirely with integer operations in
 eBPF, without a user-space lookup or per-input host computation.
 `src/qwen3_vector.bpf.c` implements residual addition, MLP gating multiply,
@@ -199,6 +200,16 @@ small exploratory samples, not a stable throughput or cross-host speed claim.
 The lookup table occupies about 512 KiB; weight conversion still happens in C
 for each active matrix row, not in BPF or in a resident weight arena.
 
+Collapsing each RMSNorm from separate tile calls and three stages into a
+single BPF invocation reduced one-token `bpf` syscalls from 50,667 to
+43,171 on the same host. The 1,024-element and 128-element operator checks
+passed; token `0`, `Hello, world!`, and `[0, 1] --generate 2` retained
+byte-identical full-vocabulary logits. Three interleaved one-token runs
+measured 1.291/1.190/1.204 s before and 1.289/1.282/1.246 s after the
+change; two interleaved `[0, 1] --generate 2` runs measured 3.282/3.183 s
+before and 3.198/3.115 s after. The call reduction is verified, but these
+small, variable timings do not establish a latency improvement.
+
 The end-to-end `[0, 1]` context returned next token ID `220`, matching the
 official Transformers 5.14.1 BF16 model. Across its 151,936 logits, mean
 absolute error was `0.024` and RMSE `0.030`; the top three token IDs agreed.
@@ -248,12 +259,13 @@ remove the dense matrix cost. C also loads BF16 tensors, converts each active
 row to Q24, calculates RoPE trigonometric inputs, and dispatches operators.
 These are real host-side responsibilities, not hidden kernel inference.
 
-`bpf_loop` now batches 16 matrix rows and up to 256 attention-history items
-per invocation. It does not turn a 28-layer model into one BPF invocation:
-matrix batches, normalization stages, and token-by-token generation still
-cross the user/kernel boundary. Bounded units keep verifier complexity and
-per-invocation runtime manageable. The attention smoke test crosses the
-256-item boundary, but a full long-context model run has not been validated.
+`bpf_loop` now batches 16 matrix rows, up to eight RMSNorm tiles, and up to
+256 attention-history items per invocation. It does not turn a 28-layer model
+into one BPF invocation: matrix batches, normalization calls, and
+token-by-token generation still cross the user/kernel boundary. Bounded units
+keep verifier complexity and per-invocation runtime manageable. The attention
+smoke test crosses the 256-item boundary, but a full long-context model run
+has not been validated.
 
 The mmap-backed array is sufficient for the current shared working buffers;
 an arena is not yet used for resident model weights. Arena allocation alone

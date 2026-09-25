@@ -12,7 +12,7 @@
 int main(int argc, char **argv)
 {
     struct bpf_object *obj = NULL;
-    struct bpf_program *accum_prog, *finalize_prog, *apply_prog;
+    struct bpf_program *full_prog;
     struct bpf_map *map;
     struct qwen3_norm_state work = {0};
     const uint8_t packet[64] = {0};
@@ -25,7 +25,7 @@ int main(int argc, char **argv)
     float weights[QWEN3_HIDDEN_SIZE];
     double sum_sq = 0, max_error = 0;
     const uint32_t key = 0;
-    int accum_fd, finalize_fd, apply_fd, map_fd, tile_index, i, count, rc = 1;
+    int full_fd, map_fd, i, count, rc = 1;
 
     if ((argc != 3 && argc != 4) ||
         (argc == 4 && strcmp(argv[3], "--qk") != 0)) {
@@ -49,68 +49,55 @@ int main(int argc, char **argv)
         fprintf(stderr, "loading BPF object failed: %s\n", strerror(errno));
         goto done;
     }
-    accum_prog = bpf_object__find_program_by_name(obj, "qwen3_rms_accumulate");
-    finalize_prog = bpf_object__find_program_by_name(obj, "qwen3_rms_finalize");
-    apply_prog = bpf_object__find_program_by_name(obj, "qwen3_rms_apply");
+    full_prog = bpf_object__find_program_by_name(obj, "qwen3_rms_full");
     map = bpf_object__find_map_by_name(obj, "norm");
-    if (!accum_prog || !finalize_prog || !apply_prog || !map) {
-        fprintf(stderr, "BPF RMSNorm programs or map missing\n");
+    if (!full_prog || !map) {
+        fprintf(stderr, "BPF RMSNorm program or map missing\n");
         goto done;
     }
-    accum_fd = bpf_program__fd(accum_prog);
-    finalize_fd = bpf_program__fd(finalize_prog);
-    apply_fd = bpf_program__fd(apply_prog);
+    full_fd = bpf_program__fd(full_prog);
     map_fd = bpf_map__fd(map);
     work.total_tiles = count / QWEN3_TILE_WIDTH;
-    for (tile_index = 0; tile_index < (int)work.total_tiles; tile_index++) {
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            int value = (tile_index * 17 + i) % 21 - 10;
-            work.activation_q16[i] = value * (1 << 16);
-            sum_sq += (double)value * value;
-        }
-        if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
-            bpf_prog_test_run_opts(accum_fd, &opts) ||
-            bpf_map_lookup_elem(map_fd, &key, &work)) {
-            perror("BPF RMSNorm accumulation");
-            goto done;
-        }
+    for (i = 0; i < count; i++) {
+        int value = ((i / QWEN3_TILE_WIDTH) * 17 +
+                     i % QWEN3_TILE_WIDTH) % 21 - 10;
+        float w = weights[i];
+        work.activation_q16[i] = value * (1 << 16);
+        work.weight_q20[i] = (int32_t)(w * (1 << 20) +
+            (w >= 0 ? 0.5f : -0.5f));
+        sum_sq += (double)value * value;
     }
-    if (work.completed_tiles != work.total_tiles ||
-        bpf_prog_test_run_opts(finalize_fd, &opts) ||
-        bpf_map_lookup_elem(map_fd, &key, &work) || !work.inv_rms_q16) {
-        fprintf(stderr, "kernel did not finalize RMSNorm\n");
+    if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
+        bpf_prog_test_run_opts(full_fd, &opts) ||
+        bpf_map_lookup_elem(map_fd, &key, &work) ||
+        work.completed_tiles != 2 * work.total_tiles ||
+        !work.inv_rms_q16) {
+        fprintf(stderr, "kernel did not complete RMSNorm\n");
         goto done;
     }
-    for (tile_index = 0; tile_index < (int)work.total_tiles; tile_index++) {
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            int index = tile_index * QWEN3_TILE_WIDTH + i;
-            int value = (tile_index * 17 + i) % 21 - 10;
-            float w = weights[index];
-            work.activation_q16[i] = value * (1 << 16);
-            work.weight_q20[i] = (int32_t)(w * (1 << 20) +
-                (w >= 0 ? 0.5f : -0.5f));
-        }
-        if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
-            bpf_prog_test_run_opts(apply_fd, &opts) ||
-            bpf_map_lookup_elem(map_fd, &key, &work)) {
-            perror("BPF RMSNorm apply");
-            goto done;
-        }
-        for (i = 0; i < QWEN3_TILE_WIDTH; i++) {
-            int index = tile_index * QWEN3_TILE_WIDTH + i;
-            int value = (tile_index * 17 + i) % 21 - 10;
-            double reference = value * weights[index] /
-                sqrt(sum_sq / count + 1e-6);
-            double observed = work.output_q16[i] / 65536.0;
-            double error = fabs(observed - reference);
-            if (error > max_error)
-                max_error = error;
-        }
+    for (i = 0; i < count; i++) {
+        int value = ((i / QWEN3_TILE_WIDTH) * 17 +
+                     i % QWEN3_TILE_WIDTH) % 21 - 10;
+        double reference = value * weights[i] /
+            sqrt(sum_sq / count + 1e-6);
+        double observed = work.output_q16[i] / 65536.0;
+        double error = fabs(observed - reference);
+        if (error > max_error)
+            max_error = error;
     }
     printf("kernel RMSNorm: %d elements, inv_rms_q16=%llu, max_abs_error=%.9g\n",
            count, (unsigned long long)work.inv_rms_q16, max_error);
     if (max_error > 0.005) {
         fprintf(stderr, "kernel RMSNorm exceeds one-vector error budget\n");
+        goto done;
+    }
+    memset(&work, 0, sizeof(work));
+    work.total_tiles = QWEN3_HIDDEN_TILES + 1;
+    if (bpf_map_update_elem(map_fd, &key, &work, BPF_ANY) ||
+        bpf_prog_test_run_opts(full_fd, &opts) ||
+        bpf_map_lookup_elem(map_fd, &key, &work) ||
+        work.completed_tiles || work.inv_rms_q16) {
+        fprintf(stderr, "kernel accepted oversized RMSNorm input\n");
         goto done;
     }
     rc = 0;

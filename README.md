@@ -13,7 +13,47 @@ BF16 rows to BPF for exact Q24 lookup. Model arithmetic and argmax run in eBPF. 
 ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
 data are distributed here.
 
-## Current experiment
+## How one token is computed
+
+```mermaid
+flowchart TD
+    A["C: tokenize text, load BF16 weights"] --> B["C: embedding and BPF dispatch"]
+    B --> C
+    subgraph L["One decoder layer, repeated 28 times in C"]
+        C["RMSNorm · norm.bpf.c"] --> D["Q/K/V projections · batch.bpf.c"]
+        D --> E["Q/K norm and RoPE · norm + rope"]
+        E --> F["Causal attention · attention.bpf.c ↔ KV map"]
+        F --> G["Output projection and residual · batch + vector"]
+        G --> H["MLP: norm, gate/up, SiLU, down, residual"]
+    end
+    H -- "next layer" --> C
+    H -- "after layer 28" --> I["Final norm, vocabulary projection and argmax · norm + batch"]
+    I --> J["C: decode next token ID to text"]
+```
+
+The diagram shows *multiple bounded BPF program invocations*, not one
+long-running kernel program. C chooses the operator order and supplies the
+current weights and vectors. The attention program owns the BPF KV map; its
+cached K/V vectors are reused when the next token runs through the layers.
+The default path converts active BF16 rows to Q24 in C. The optional BF16
+arena path moves that conversion into BPF for one batch at a time; neither
+path keeps the entire model in the arena.
+
+| Kernel program | Role in full inference |
+| --- | --- |
+| `qwen3_batch.bpf.c` | Bounded matrix rows for Q/K/V, output, MLP, and vocabulary projection; tracks the winning vocabulary logit. |
+| `qwen3_norm.bpf.c` | RMSNorm, including Q/K and final normalization. |
+| `qwen3_rope.bpf.c` | Rotates query and key heads using sine/cosine values supplied by C. |
+| `qwen3_attention.bpf.c` | Causal attention and BPF-map KV-cache writes/reads. |
+| `qwen3_silu.bpf.c`, `qwen3_vector.bpf.c` | MLP activation, gating multiply, and residual additions. |
+| `qwen3_arena_bf16.bpf.c` | Optional exact-weight, bounded arena-batch alternative to `qwen3_batch.bpf.c`. |
+
+`qwen3_matvec.bpf.c`, `qwen3_int4.bpf.c`, `qwen3_int8.bpf.c`, and
+`qwen3_arena_int4.bpf.c` are separate operator experiments, not the default
+full-model path. See the implementation notes below for their evidence and
+limits.
+
+## Implementation notes and experiments
 
 `src/qwen3_matvec.bpf.c` runs integer multiply-accumulate in a socket-filter
 BPF program, with Q8×Q8 and Q16-activation×Q24-weight paths.
@@ -102,6 +142,8 @@ produced in eBPF.
 For a one-token context, attention softmax has exactly one entry and is exactly
 1. Longer contexts exercise the actual Q/K and attention path.
 
+## Build and run
+
 On a Linux host with clang's BPF target, libbpf, libelf, zlib, json-c, and
 Oniguruma development headers, make, and BPF loading privileges:
 
@@ -165,6 +207,8 @@ text supplied to `--prompt`; the CLI does not invent a chat template.
 `--generate` defaults to 1 and stops early on Qwen's end-of-turn ID `151645`.
 Set `QWEN3_TRACE=1` for intermediate range diagnostics. The tokenizer is
 loaded from the official `tokenizer.json` at runtime; it is not vendored.
+
+## Measurements and validation
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row

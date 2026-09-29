@@ -121,7 +121,7 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   then applies head-wise Q/K RMSNorm and position-dependent RoPE. A separate
   event check also stores first-layer K/V in a kernel map and computes
   attention over consecutive token packets, followed by the output projection,
-  residual addition, post-attention RMSNorm, and MLP gate/up projections.
+  residual addition, post-attention RMSNorm, and the complete first-layer MLP.
   C still schedules the 28
   layers in full inference and handles text. No full-model event path or
   end-to-end speedup has been

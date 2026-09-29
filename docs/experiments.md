@@ -177,6 +177,16 @@ are not a matched full-request comparison. SiLU, the gate/up product, down
 projection, later layers, argmax, and network result delivery remain outside
 the event path.
 
+The first-layer path now also applies SiLU to the gate projection, multiplies
+it by the up projection, schedules the 1,024-row down projection from the
+3,072-element product, and adds the result to the hidden vector. The ten
+packet-triggered two-token requests matched C fixed-point references for the
+MLP product, down projection, and final layer hidden state element by element.
+This 12,288-row prefix took about 15.1–15.3 ms per packet on the shared
+container in this run. It is not a full-model result or a matched user-space
+comparison; the remaining 27 layers, vocabulary argmax, and network return
+path are not implemented in the event scheduler.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

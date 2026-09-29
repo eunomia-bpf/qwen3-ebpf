@@ -44,11 +44,10 @@ each batch. An optional continuation writes K/V to a kernel map and requeues
 one attention step per prior position for all 16 query heads, then runs the
 resident output-projection matrix, adds it to the original hidden vector,
 applies the resident post-attention RMSNorm weights, and runs the MLP gate/up
-projections. The SiLU/gating product and down projection are not yet on this
-event path.
+projections, SiLU/gating product, down projection, and second residual.
 It accepts consecutive positions in a single-session 256-position cache; a
 position-zero packet starts a new sequence. This keeps the receive hook short,
-but the 28-layer scheduler and final-token result delivery are not yet
+but the remaining 27 layers and final-token result delivery are not yet
 kernel-owned. Merely changing the hook type does not provide those pieces,
 and full inference must not run inline in XDP.
 

@@ -125,6 +125,17 @@ matrix timing excludes this additional work and is not a matched comparison.
 RoPE, attention, output projection, residual, MLP, later layers, and final
 token selection are still absent from the event path.
 
+The following XDP increment sends a position alongside the token ID. BPF
+generates RoPE sine/cosine coefficients from its resident inverse-frequency
+constants and rotates all first-layer Q/K heads after normalization. Ten
+requests at positions 0, 1, 128, and 40,959 (two alternating real token IDs)
+matched the C reference coefficient arrays and all 4,096 Q/K/V outputs
+exactly in Q16/Q20 fixed-point arithmetic. An out-of-range position did not
+start work. The observed packet-to-result timings remain operator-prefix
+measurements, not a full-model speed comparison. Attention, output projection,
+residual, MLP, later layers, and final token selection remain outside the
+XDP-triggered path.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

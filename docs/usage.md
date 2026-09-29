@@ -65,10 +65,13 @@ advances through all 4,096 rows in 128-row batches after each packet. Packets
 alternate two token IDs; the workqueue reads their embeddings from resident
 weights and performs first-layer input RMSNorm before the projections, then
 head-wise RMSNorm on Q/K. The test compares embedding, normalized vector, raw
-Q/K/V projection rows, and normalized Q/K heads with C references.
+Q/K/V projection rows, and rotated Q/K heads with C references at positions
+0, 1, 128, and 40,959. The packet carries a 32-bit token ID and a 32-bit
+position; the BPF work item calculates RoPE coefficients without C input.
 Do not run either XDP test in a production network namespace. They are not
 full-model inference: the loader still supplies resident weights and reads
-results, and no subsequent decoder operators or layers run in this event path.
+results, and attention, MLP, later layers, and final token selection do not
+run in this event path.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:

@@ -15,6 +15,8 @@
 #include "qwen3_arena_bf16.skel.h"
 #include "safetensors.h"
 
+static const uint32_t rope_positions[4] = {0, 1, 128, 40959};
+
 static int run_kernel(struct qwen3_arena_bf16_bpf *skel,
                       struct qwen3_arena_bf16_work *work, int rows)
 {
@@ -146,10 +148,12 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                          const int32_t *expected, uint32_t total,
                          const int32_t *expected_inputs,
                          const int32_t *expected_embeddings,
-                         const uint32_t *token_ids)
+                         const uint32_t *token_ids,
+                         const int32_t *expected_cosine,
+                         const int32_t *expected_sine)
 {
     const __u32 key = 0;
-    unsigned char payload[8] = {'Q', '3', 'B', 'P'};
+    unsigned char payload[12] = {'Q', '3', 'B', 'P'};
     const char ignored[] = "Q3XX";
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
     struct qwen3_event_state job;
@@ -211,17 +215,40 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
             goto done;
         }
     }
+    if (work->event_rope) {
+        uint32_t invalid_position = 40960;
+
+        payload[4] = payload[5] = payload[6] = payload[7] = 0;
+        payload[8] = (unsigned char)(invalid_position >> 24);
+        payload[9] = (unsigned char)(invalid_position >> 16);
+        payload[10] = (unsigned char)(invalid_position >> 8);
+        payload[11] = (unsigned char)invalid_position;
+        if (sendto(fd, payload, sizeof(payload), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) ||
+            bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+            job.status != QWEN3_EVENT_READY || job.requests != 0) {
+            fprintf(stderr, "out-of-range position started a request\n");
+            goto done;
+        }
+    }
     for (attempt = 0; attempt < 10; attempt++) {
         uint32_t expected_stride = work->event_qkv ? 4096 : total;
         const int32_t *request_expected = expected +
-            (work->event_use_token ? (attempt % 2) * expected_stride : 0);
+            (work->event_rope ? (attempt % 4) * expected_stride :
+             work->event_use_token ? (attempt % 2) * expected_stride : 0);
         uint32_t token_id = work->event_use_token ? token_ids[attempt % 2] : 0;
-        size_t payload_size = work->event_use_token ? 8 : 4;
+        size_t payload_size = work->event_rope ? 12 :
+                              work->event_use_token ? 8 : 4;
+        uint32_t position = rope_positions[attempt % 4];
 
         payload[4] = (unsigned char)(token_id >> 24);
         payload[5] = (unsigned char)(token_id >> 16);
         payload[6] = (unsigned char)(token_id >> 8);
         payload[7] = (unsigned char)token_id;
+        payload[8] = (unsigned char)(position >> 24);
+        payload[9] = (unsigned char)(position >> 16);
+        payload[10] = (unsigned char)(position >> 8);
+        payload[11] = (unsigned char)position;
         if (work->event_qkv) {
             for (i = 0; i < 2048; i++)
                 work->query_q16[i] = INT32_MIN;
@@ -264,6 +291,9 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
             job.finish_ns < job.start_ns ||
             (work->event_qkv && work->event_stage != QWEN3_EVENT_STAGE_V) ||
             (work->event_qkv && work->completed_qk_heads != 24) ||
+            (work->event_rope &&
+             (work->completed_rope_heads != 24 ||
+              work->event_position != position)) ||
             work->base_index != (work->event_qkv ?
                 QWEN3_ARENA_TOKEN_WIDTH : total) ||
             work->completed != ((total - 1) % QWEN3_ARENA_BF16_ROWS + 1)) {
@@ -271,6 +301,21 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                     (unsigned long long)job.status, job.requests,
                     job.completed_requests, work->base_index, work->completed);
             goto done;
+        }
+        if (work->event_rope) {
+            for (i = 0; i < 64; i++) {
+                if (work->rope_cosine_q20[i] !=
+                        expected_cosine[(attempt % 4) * 64 + i] ||
+                    work->rope_sine_q20[i] !=
+                        expected_sine[(attempt % 4) * 64 + i]) {
+                    fprintf(stderr, "XDP RoPE coefficient %u mismatch at position %u: cos=%d/%d sin=%d/%d\n",
+                            i, position, work->rope_cosine_q20[i],
+                            expected_cosine[(attempt % 4) * 64 + i],
+                            work->rope_sine_q20[i],
+                            expected_sine[(attempt % 4) * 64 + i]);
+                    goto done;
+                }
+            }
         }
         for (i = 0; i < expected_stride; i++) {
             int32_t observed = work->event_qkv ?
@@ -327,7 +372,9 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     uint64_t head_norm_byte[2], head_norm_first[2], head_norm_elements[2];
     int32_t q24[1024], hidden[2][1024], normalized[2][1024];
     int32_t norm_q20[1024], head_norm_q20[2][128];
-    int32_t expected[2][4096], event_expected[2][4096];
+    int32_t expected[2][4096], norm_expected[2][4096];
+    int32_t event_expected[4][4096];
+    int32_t rope_cosine[4][64], rope_sine[4][64];
     int32_t direct_outputs[4096];
     float embedding[1024], norm_weights[1024], head_norm_weights[2][128];
     const uint8_t *embedding_raw, *norm_raw;
@@ -419,6 +466,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     work->embedding_vocab = 151936;
     work->event_use_token = 1;
     work->event_qkv = 1;
+    work->event_rope = 1;
     for (col = 0; col < 1024; col++) {
         double scaled = (double)norm_weights[col] * 1048576.0;
 
@@ -478,7 +526,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                     (int32_t)sum;
             }
         }
-        memcpy(event_expected[token], expected[token], sizeof(expected[token]));
+        memcpy(norm_expected[token], expected[token], sizeof(expected[token]));
         for (int head = 0; head < 24; head++) {
             int set = head >= 16;
             int base = set ? 2048 + (head - 16) * 128 : head * 128;
@@ -493,8 +541,36 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             for (int i = 0; i < 128; i++) {
                 int64_t scaled = ((int64_t)expected[token][base + i] *
                                   (int64_t)inv_rms_q16) >> 16;
-                event_expected[token][base + i] =
+                norm_expected[token][base + i] =
                     (int32_t)((scaled * head_norm_q20[set][i]) >> 20);
+            }
+        }
+    }
+    for (int scenario = 0; scenario < 4; scenario++) {
+        int selected_token = scenario % 2;
+        int position = rope_positions[scenario];
+
+        memcpy(event_expected[scenario], norm_expected[selected_token],
+               sizeof(norm_expected[selected_token]));
+        for (int i = 0; i < 64; i++) {
+            double angle = position * pow(1000000.0, -(double)i / 64.0);
+
+            rope_cosine[scenario][i] = (int32_t)round(cos(angle) * (1 << 20));
+            rope_sine[scenario][i] = (int32_t)round(sin(angle) * (1 << 20));
+        }
+        for (int head = 0; head < 24; head++) {
+            int base = head < 16 ? head * 128 : 2048 + (head - 16) * 128;
+
+            for (int i = 0; i < 64; i++) {
+                int64_t first = event_expected[scenario][base + i];
+                int64_t second = event_expected[scenario][base + i + 64];
+                int64_t cosine = rope_cosine[scenario][i];
+                int64_t sine = rope_sine[scenario][i];
+
+                event_expected[scenario][base + i] =
+                    (int32_t)((first * cosine - second * sine) >> 20);
+                event_expected[scenario][base + i + 64] =
+                    (int32_t)((second * cosine + first * sine) >> 20);
             }
         }
     }
@@ -535,7 +611,8 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                attempt + 1, (double)elapsed_ns / 1000000.0);
     }
     rc = run_xdp_event(skel, work, &event_expected[0][0], 2048,
-                       &normalized[0][0], &hidden[0][0], token_ids);
+                       &normalized[0][0], &hidden[0][0], token_ids,
+                       &rope_cosine[0][0], &rope_sine[0][0]);
 done:
     safetensors_close(&file);
     return rc;
@@ -632,7 +709,8 @@ int main(int argc, char **argv)
         expected[1] = (int32_t)work->output_q16[1];
         if (argc == 1 ||
             (strcmp(argv[1], "--xdp-loopback") == 0 ?
-             !run_xdp_event(skel, work, expected, 2, NULL, NULL, NULL) :
+             !run_xdp_event(skel, work, expected, 2, NULL, NULL, NULL,
+                            NULL, NULL) :
              !run_model_rows(skel, work, argv[1]))) {
             puts("arena BF16 smoke passed");
             rc = 0;

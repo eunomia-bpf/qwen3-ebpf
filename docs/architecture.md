@@ -35,8 +35,9 @@ socket or XDP interface. The optional arena object now has a separate XDP
 entrypoint: a matching UDP packet queues a BPF work item that advances through
 all batches of the first-layer Q/K/V resident-weight matrices. The test reads
 their results from a BPF map. After projection, the work item also normalizes
-each Q/K head using resident BF16 weights. In the real-weight test, the packet
-supplies a token ID. The work item first reads its embedding and first-layer RMSNorm
+each Q/K head using resident BF16 weights and applies RoPE with coefficients
+calculated in BPF. In the real-weight test, the packet supplies a token ID and
+position. The work item first reads its embedding and first-layer RMSNorm
 weights from resident storage. The callback requeues itself across matrix
 batches and projection stages until all rows finish, without C dispatching
 each batch. This keeps the receive hook short, but the 28-layer scheduler and
@@ -134,7 +135,9 @@ up to 3,072 elements per BPF invocation via bounded `bpf_loop` tiles and a
 memory-mapped work map.
 `src/bpf/qwen3_rope.bpf.c` rotates paired half-head dimensions in eBPF. A bounded
 `bpf_loop` processes all 16 query and eight key heads in one invocation per
-layer; C supplies their shared sine/cosine values once per layer.
+layer; C supplies their shared sine/cosine values once per layer in the
+full-model driver. The separate XDP workqueue path computes these coefficients
+in BPF from the packet's position and the model's inverse frequencies.
 `src/bpf/qwen3_attention.bpf.c` computes Q·K scores and an online, stable
 softmax/V reduction for each prior position. It writes new K/V pairs into a
 BPF map, then traverses its history in bounded `bpf_loop` chunks; C supplies

@@ -123,10 +123,12 @@ static int run_resident_synthetic(struct qwen3_arena_bf16_bpf *skel,
 }
 
 static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
-                         struct qwen3_arena_bf16_work *work)
+                         struct qwen3_arena_bf16_work *work,
+                         const int32_t *expected, uint32_t total)
 {
     const __u32 key = 0;
     const char payload[] = "Q3BP";
+    const char ignored[] = "Q3XX";
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
     struct qwen3_event_state job;
     struct bpf_link *link = NULL;
@@ -136,19 +138,16 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
     struct timespec begin, now;
-    __s64 expected[2], elapsed_ns;
+    __s64 elapsed_ns;
     unsigned int ifindex = if_nametoindex("lo");
     int fd = -1, rc = -1;
+    uint32_t i, attempt;
 
-    if (!ifindex) {
-        perror("loopback ifindex");
+    if (!ifindex || !total || total > QWEN3_ARENA_EVENT_OUTPUTS) {
+        fprintf(stderr, "invalid loopback interface or matrix row count\n");
         return -1;
     }
-    expected[0] = work->output_q16[0];
-    expected[1] = work->output_q16[1];
-    work->output_q16[0] = INT64_MIN;
-    work->output_q16[1] = INT64_MIN;
-    work->completed = 0;
+    work->matrix_total_rows = total;
     if (bpf_prog_test_run_opts(bpf_program__fd(skel->progs.qwen3_event_init),
                                &opts) || opts.retval) {
         fprintf(stderr, "BPF workqueue initialization failed\n");
@@ -162,49 +161,155 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         goto done;
     }
     fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0 || clock_gettime(CLOCK_MONOTONIC, &begin)) {
-        perror("XDP event socket/clock");
+    if (fd < 0) {
+        perror("XDP event socket");
         goto done;
     }
-    if (sendto(fd, payload, sizeof(payload) - 1, 0,
-               (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) - 1) {
-        perror("XDP event sendto");
+    if (sendto(fd, ignored, sizeof(ignored) - 1, 0,
+               (struct sockaddr *)&dst, sizeof(dst)) != sizeof(ignored) - 1 ||
+        bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+        job.status != QWEN3_EVENT_READY || job.requests != 0) {
+        fprintf(stderr, "unrecognized XDP packet started a request\n");
         goto done;
     }
-    do {
-        if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job)) {
-            perror("XDP event lookup");
+    for (attempt = 0; attempt < 10; attempt++) {
+        for (i = 0; i < total; i++)
+            work->matrix_output_q16[i] = INT32_MIN;
+        work->completed = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &begin))
+            goto done;
+        if (sendto(fd, payload, sizeof(payload) - 1, 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) - 1) {
+            perror("XDP event sendto");
             goto done;
         }
-        if (job.status == QWEN3_EVENT_ERROR) {
-            fprintf(stderr, "XDP event callback/start failed\n");
+        do {
+            if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job)) {
+                perror("XDP event lookup");
+                goto done;
+            }
+            if (job.status == QWEN3_EVENT_ERROR) {
+                fprintf(stderr, "XDP event callback/start failed\n");
+                goto done;
+            }
+            if (job.status == QWEN3_EVENT_DONE &&
+                job.completed_requests == attempt + 1)
+                break;
+            usleep(50);
+            if (clock_gettime(CLOCK_MONOTONIC, &now))
+                goto done;
+            elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
+                         now.tv_nsec - begin.tv_nsec;
+        } while (elapsed_ns < 30000000000LL);
+        if (job.status != QWEN3_EVENT_DONE || job.requests != attempt + 1 ||
+            job.completed_requests != attempt + 1 ||
+            job.finish_ns < job.start_ns ||
+            work->base_index != total ||
+            work->completed != ((total - 1) % QWEN3_ARENA_BF16_ROWS + 1)) {
+            fprintf(stderr, "XDP event state mismatch: status=%llu requests=%u completions=%u base=%u completed=%u\n",
+                    (unsigned long long)job.status, job.requests,
+                    job.completed_requests, work->base_index, work->completed);
             goto done;
         }
-        if (job.status == QWEN3_EVENT_DONE)
-            break;
-        usleep(1000);
+        for (i = 0; i < total; i++)
+            if (work->matrix_output_q16[i] != expected[i]) {
+                fprintf(stderr, "XDP event row %u mismatch: BPF=%d C=%d\n",
+                        i, work->matrix_output_q16[i], expected[i]);
+                goto done;
+            }
         if (clock_gettime(CLOCK_MONOTONIC, &now))
             goto done;
         elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
                      now.tv_nsec - begin.tv_nsec;
-    } while (elapsed_ns < 5000000000LL);
-    if (job.status != QWEN3_EVENT_DONE || job.requests != 1 ||
-        work->completed != 2 || work->output_q16[0] != expected[0] ||
-        work->output_q16[1] != expected[1]) {
-        fprintf(stderr, "XDP event result mismatch: status=%llu requests=%u completed=%u\n",
-                (unsigned long long)job.status, job.requests, work->completed);
-        goto done;
+        printf("XDP request %u -> %u resident matvec rows: host %.3f ms, kernel %.3f ms\n",
+               attempt + 1, total, (double)elapsed_ns / 1000000.0,
+               (double)(job.finish_ns - job.start_ns) / 1000000.0);
     }
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
-                 now.tv_nsec - begin.tv_nsec;
-    printf("XDP live packet -> BPF workqueue -> resident matvec: %.3f ms\n",
-           (double)elapsed_ns / 1000000.0);
     rc = 0;
 done:
     if (fd >= 0)
         close(fd);
     bpf_link__destroy(link);
+    return rc;
+}
+
+static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
+                         struct qwen3_arena_bf16_work *work,
+                         const char *path)
+{
+    struct safetensors_file file;
+    struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
+    uint64_t first_byte, elements;
+    int32_t q24[1024], expected[2048], direct_outputs[2048];
+    const uint8_t *raw;
+    int row, col, rc = -1;
+
+    if (safetensors_open(&file, path))
+        return -1;
+    if (safetensors_find_bf16(&file,
+            "model.layers.0.self_attn.q_proj.weight", &first_byte,
+            &elements) || elements != 2048ULL * 1024)
+        goto done;
+    raw = file.mapping + 8 + file.header_length + first_byte;
+    memset(work, 0, sizeof(*work));
+    work->model_elements = elements;
+    if (bpf_prog_test_run_opts(
+            bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
+            &opts) || opts.retval || !skel->bss->model_bf16) {
+        fprintf(stderr, "XDP model arena allocation failed\n");
+        goto done;
+    }
+    memcpy(skel->bss->model_bf16, raw, elements * 2);
+    work->cols = 1024;
+    work->rows = QWEN3_ARENA_BF16_ROWS;
+    work->resident_weights = 1;
+    for (col = 0; col < 1024; col++)
+        work->input_q16[col] = ((col % 11) - 5) * 8192;
+    for (row = 0; row < 2048; row++) {
+        __s64 sum = 0;
+
+        if (safetensors_read_bf16_q24_at(&file, first_byte,
+                (uint64_t)row * 1024, 1024, q24))
+            goto done;
+        for (col = 0; col < 1024; col++)
+            sum += (__s64)work->input_q16[col] * q24[col];
+        sum >>= 24;
+        if (sum > INT32_MAX || sum < INT32_MIN)
+            goto done;
+        expected[row] = (int32_t)sum;
+    }
+    for (int attempt = 0; attempt < 10; attempt++) {
+        struct timespec begin, end;
+        __s64 elapsed_ns;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &begin))
+            goto done;
+        for (row = 0; row < 2048; row += QWEN3_ARENA_BF16_ROWS) {
+            work->base_index = row;
+            if (run_kernel(skel, work, QWEN3_ARENA_BF16_ROWS))
+                goto done;
+            for (int i = 0; i < QWEN3_ARENA_BF16_ROWS; i++) {
+                if (work->output_q16[i] > INT32_MAX ||
+                    work->output_q16[i] < INT32_MIN)
+                    goto done;
+                direct_outputs[row + i] = (int32_t)work->output_q16[i];
+            }
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &end))
+            goto done;
+        for (row = 0; row < 2048; row++)
+            if (direct_outputs[row] != expected[row]) {
+                fprintf(stderr, "direct model row %d mismatch\n", row);
+                goto done;
+            }
+        elapsed_ns = (__s64)(end.tv_sec - begin.tv_sec) * 1000000000 +
+                     end.tv_nsec - begin.tv_nsec;
+        printf("BPF_PROG_RUN request %d -> 2048 resident matvec rows: %.3f ms\n",
+               attempt + 1, (double)elapsed_ns / 1000000.0);
+    }
+    rc = run_xdp_event(skel, work, expected, 2048);
+done:
+    safetensors_close(&file);
     return rc;
 }
 
@@ -270,8 +375,9 @@ int main(int argc, char **argv)
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t length = ((sizeof(*work) + page - 1) / page) * page;
     int rc = 1;
+    int32_t expected[2];
 
-    if (argc > 2)
+    if (argc > 3 || (argc == 3 && strcmp(argv[1], "--xdp-model")))
         return 2;
     skel = qwen3_arena_bf16_bpf__open_and_load();
     if (!skel) {
@@ -285,14 +391,26 @@ int main(int argc, char **argv)
         goto done;
     }
     populate_lut(skel);
-    if (!run_synthetic(skel, work) &&
-        !run_resident_synthetic(skel, work) &&
-        (argc == 1 ||
-         (strcmp(argv[1], "--xdp-loopback") == 0 ?
-          !run_xdp_event(skel, work) : !run_model_rows(skel, work, argv[1])))) {
-        puts("arena BF16 smoke passed");
-        rc = 0;
+    if (argc == 3) {
+        if (!run_xdp_model(skel, work, argv[2])) {
+            puts("arena BF16 XDP model smoke passed");
+            rc = 0;
+        }
+        goto unmap;
     }
+    if (!run_synthetic(skel, work) &&
+        !run_resident_synthetic(skel, work)) {
+        expected[0] = (int32_t)work->output_q16[0];
+        expected[1] = (int32_t)work->output_q16[1];
+        if (argc == 1 ||
+            (strcmp(argv[1], "--xdp-loopback") == 0 ?
+             !run_xdp_event(skel, work, expected, 2) :
+             !run_model_rows(skel, work, argv[1]))) {
+            puts("arena BF16 smoke passed");
+            rc = 0;
+        }
+    }
+unmap:
     munmap(work, length);
 done:
     qwen3_arena_bf16_bpf__destroy(skel);

@@ -56,12 +56,16 @@ and reads results, so this is not yet a user-space-free inference service.
 The ordinary arena test loads an ephemeral BPF program and map; it attaches
 to no network interface. To exercise the separate packet-triggered operator
 on a disposable test network namespace, run `make test-arena-xdp`. That test
-temporarily attaches XDP to the namespace's loopback interface, sends one
-UDP request, waits for the BPF workqueue to calculate two resident BF16 rows,
-checks both outputs against C, and detaches the BPF link before exit. Do not
-run the XDP test in a production network namespace. It is not full-model
-inference: the test loader still supplies the input vector and resident
-weights, and reads the result.
+temporarily attaches XDP to the namespace's loopback interface, sends ten
+UDP requests, waits for the BPF workqueue to calculate two resident BF16 rows
+per request, checks the outputs against C, and detaches the BPF link before
+exit. `make test-arena-xdp-model MODEL=/path/to/model.safetensors` instead
+uses the official layer-0 Q-projection matrix: the kernel workqueue advances
+through all 2,048 rows in 128-row batches after each packet, and the test
+compares all outputs with the C Q24 reference. Do not run either XDP test in
+a production network namespace. They are not full-model inference: the test
+loader still supplies the input vector and resident weights, and reads the
+result.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:
@@ -133,6 +137,7 @@ network or kernel event.
 | `make build/infer-arena-bf16` | Build the optional full-model arena path and its operator dependencies. |
 | `make test-arena-bf16` / `make test-arena-int4` | Optional arena operator checks, with `MODEL=...` for real weights. |
 | `make test-arena-xdp` | Live loopback XDP → BPF workqueue → resident BF16 operator check in the current network namespace. |
+| `make test-arena-xdp-model MODEL=...` | Ten live requests for the complete first-layer Q-projection matrix with official weights and C-reference comparison. |
 | `make clean` | Remove only generated files under `build/`. |
 
 Output names and CLI arguments are unchanged. Tests live in `tests/`, shared

@@ -120,6 +120,32 @@ int qwen3_arena_bf16_rows(struct __sk_buff *skb)
     return 0;
 }
 
+static long store_output_row(__u32 row, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 index;
+    __s64 output;
+
+    if (!state || row >= state->rows) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    /* The mask makes the verifier retain a bounded 64-bit map offset. */
+    index = (state->base_index + row) & 4095u;
+    if (index >= QWEN3_ARENA_EVENT_OUTPUTS) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    output = state->output_q16[row & (QWEN3_ARENA_BF16_ROWS - 1)];
+    if (output > 2147483647LL || output < -2147483648LL) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    state->matrix_output_q16[index] = (__s32)output;
+    return 0;
+}
+
 static int event_callback(void *map, int *key, void *value)
 {
     const __u32 work_key = 0;
@@ -127,6 +153,7 @@ static int event_callback(void *map, int *key, void *value)
     struct qwen3_arena_bf16_work *state =
         bpf_map_lookup_elem(&work, &work_key);
     __u32 callback_ctx = 0;
+    __u32 total, base, rows;
 
     (void)map;
     (void)key;
@@ -135,10 +162,39 @@ static int event_callback(void *map, int *key, void *value)
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
+    total = state->matrix_total_rows ? state->matrix_total_rows : state->rows;
+    base = state->base_index;
+    rows = state->rows;
+    if (total > QWEN3_ARENA_EVENT_OUTPUTS || base >= total ||
+        rows > total - base) {
+        job->status = QWEN3_EVENT_ERROR;
+        return 0;
+    }
     state->completed = 0;
-    bpf_loop(state->rows, compute_row, &callback_ctx, 0);
-    job->status = state->completed == state->rows ?
-        QWEN3_EVENT_DONE : QWEN3_EVENT_ERROR;
+    bpf_loop(rows, compute_row, &callback_ctx, 0);
+    if (state->completed != rows) {
+        job->status = QWEN3_EVENT_ERROR;
+        return 0;
+    }
+    callback_ctx = 0;
+    bpf_loop(rows, store_output_row, &callback_ctx, 0);
+    if (callback_ctx) {
+        job->status = QWEN3_EVENT_ERROR;
+        return 0;
+    }
+    base += rows;
+    if (base == total) {
+        state->base_index = base;
+        job->finish_ns = bpf_ktime_get_ns();
+        job->completed_requests++;
+        job->status = QWEN3_EVENT_DONE;
+        return 0;
+    }
+    state->base_index = base;
+    state->rows = total - base < QWEN3_ARENA_BF16_ROWS ?
+        total - base : QWEN3_ARENA_BF16_ROWS;
+    if (bpf_wq_start(&job->work, 0))
+        job->status = QWEN3_EVENT_ERROR;
     return 0;
 }
 
@@ -167,6 +223,7 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     unsigned char *payload;
     const __u32 key = 0;
     struct qwen3_event_state *job;
+    __u64 old_status;
 
     if ((void *)(eth + 1) > end || eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
@@ -182,12 +239,34 @@ int qwen3_event_xdp(struct xdp_md *ctx)
         payload[2] != 'B' || payload[3] != 'P')
         return XDP_PASS;
     job = bpf_map_lookup_elem(&event, &key);
-    if (!job || __sync_val_compare_and_swap(&job->status,
-                                             QWEN3_EVENT_READY,
-                                             QWEN3_EVENT_RUNNING) !=
-                                             QWEN3_EVENT_READY)
+    if (!job)
         return XDP_PASS;
+    old_status = __sync_val_compare_and_swap(&job->status,
+                                              QWEN3_EVENT_READY,
+                                              QWEN3_EVENT_RUNNING);
+    if (old_status != QWEN3_EVENT_READY &&
+        (old_status != QWEN3_EVENT_DONE ||
+         __sync_val_compare_and_swap(&job->status,
+                                      QWEN3_EVENT_DONE,
+                                      QWEN3_EVENT_RUNNING) !=
+                                      QWEN3_EVENT_DONE))
+        return XDP_PASS;
+    {
+        struct qwen3_arena_bf16_work *state =
+            bpf_map_lookup_elem(&work, &key);
+
+        if (!state) {
+            job->status = QWEN3_EVENT_ERROR;
+            return XDP_PASS;
+        }
+        state->base_index = 0;
+        if (state->matrix_total_rows)
+            state->rows = state->matrix_total_rows < QWEN3_ARENA_BF16_ROWS ?
+                state->matrix_total_rows : QWEN3_ARENA_BF16_ROWS;
+    }
     job->requests++;
+    job->start_ns = bpf_ktime_get_ns();
+    job->finish_ns = 0;
     if (bpf_wq_start(&job->work, 0))
         job->status = QWEN3_EVENT_ERROR;
     return XDP_PASS;

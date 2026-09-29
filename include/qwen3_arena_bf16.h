@@ -6,6 +6,7 @@
 
 #define QWEN3_ARENA_BF16_ROWS 128
 #define QWEN3_ARENA_BF16_COLS 3072
+#define QWEN3_ARENA_EVENT_OUTPUTS 3072
 #define QWEN3_ARENA_MODEL_MAX_BF16 (768u * 1024u * 1024u)
 
 #define QWEN3_EVENT_READY 1u
@@ -17,6 +18,9 @@ struct qwen3_event_state {
     struct bpf_wq work;
     __u64 status;
     __u32 requests;
+    __u32 completed_requests;
+    __u64 start_ns;
+    __u64 finish_ns;
 };
 
 struct qwen3_arena_bf16_work {
@@ -32,6 +36,8 @@ struct qwen3_arena_bf16_work {
     __u64 weight_first_bf16;
     __u64 model_elements;
     __u32 resident_weights;
+    __u32 matrix_total_rows;
+    __s32 matrix_output_q16[QWEN3_ARENA_EVENT_OUTPUTS];
 };
 
 #endif

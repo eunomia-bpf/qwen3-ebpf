@@ -69,6 +69,18 @@ results. Two packet-to-result observations were 0.120 and 1.180 ms; these
 are only operator-path measurements, not full-model latency or speedup
 claim. The test loader supplied the input and read the map result.
 
+The next event-path check used the official layer-0 Q-projection tensor
+(2,048 × 1,024 BF16 weights) and one deterministic Q16 activation. Ten
+consecutive loopback UDP requests each advanced all 16 BPF workqueue batches
+without a user-space dispatch between batches. All 2,048 outputs per request
+matched the independent C Q24 dot products. On one shared-host run, median
+wall time was 2.124 ms for ten sets of 16 `BPF_PROG_RUN` dispatches and
+2.211 ms from packet send to completion observed by the test; the XDP-to-BPF
+completion timestamp median was 2.125 ms. The paths have different timing
+boundaries and the host was not isolated. This establishes neither a speedup
+nor complete model inference; the loader still supplies activations, and the
+28-layer schedule is in C.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

@@ -9,6 +9,38 @@ repository reorganization.
 
 ## Measurements and validation
 
+### Fixed-excerpt next-token scoring (2026-09-29)
+
+The current full-model driver scored two text excerpts from the
+WikiText-2 *raw* test split, using the official Qwen3-0.6B BF16 weights and
+tokenizer. The source Parquet file was
+[`Salesforce/wikitext` test-00000-of-00001.parquet](https://huggingface.co/datasets/Salesforce/wikitext/blob/main/wikitext-2-raw-v1/test-00000-of-00001.parquet),
+SHA-256 `5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91`.
+One excerpt concatenated rows 3 and 4; the other used row 1011, the first row
+at or after 1000 with 500–750 characters. The UTF-8 excerpt file hashes were
+`f52e5b6da11cbe8bd5b077ec943d0932823c47df841de85d80582a172d93f5ef`
+and `b53e6aa42d41d932cae2a7e62422c24c59d52e5682709634d3a5cfbf948479b4`.
+The excerpts were written in Windows text mode, so line endings in the files
+are CRLF; both implementations received the same bytes.
+The first input token was context, not a scored target; no BOS or chat template
+was inserted.
+
+| Test excerpt | Scored tokens | eBPF Q16 NLL / perplexity / seconds | Official BF16 CPU NLL / perplexity / seconds |
+| --- | ---: | ---: | ---: |
+| Rows 3–4 | 423 | 1358.512 / 24.819 / 401.580 | 1344.427 / 24.006 / 6.407 |
+| Row 1011 | 124 | 352.885 / 17.216 / 114.904 | 342.837 / 15.876 / 3.674 |
+
+Runs used Linux `6.17.0-1029-nvidia` on arm64. The BF16 reference was
+`tests/reference_score.py` with PyTorch `2.11.0` and Transformers `5.14.1`,
+limited to four CPU cores with `OMP_NUM_THREADS=4`; the eBPF driver used its
+normal single-threaded operator dispatch. Both timings start *after* model
+loading. They are single runs, not a controlled throughput benchmark, and the
+CPU parallelism differs. The eBPF path is much slower here; there is no
+measured speed benefit. The eBPF perplexities are higher than BF16 on both
+excerpts. This is a repeatable fixed-excerpt check, **not** whole-test-set
+perplexity, generation quality, or evidence that a live kernel event is useful.
+The model and tokenizer SHA-256 values are recorded below.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

@@ -633,6 +633,51 @@ static void diagnostic_range(const char *name, const int32_t *values, int count)
             name, low / 65536.0, high / 65536.0);
 }
 
+static int read_text_file(const char *path, char **text)
+{
+    FILE *file = fopen(path, "rb");
+    long length;
+    char *buffer;
+
+    if (!file || fseek(file, 0, SEEK_END) || (length = ftell(file)) < 0 ||
+        length > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {
+        if (file)
+            fclose(file);
+        return -1;
+    }
+    buffer = malloc((size_t)length + 1);
+    if (!buffer) {
+        fclose(file);
+        return -1;
+    }
+    if (fread(buffer, 1, (size_t)length, file) != (size_t)length) {
+        fclose(file);
+        free(buffer);
+        return -1;
+    }
+    if (fclose(file)) {
+        free(buffer);
+        return -1;
+    }
+    buffer[length] = '\0';
+    *text = buffer;
+    return 0;
+}
+
+static double next_token_nll(const int32_t *logits, uint32_t target)
+{
+    int32_t maximum = INT32_MIN;
+    double sum = 0;
+    int i;
+
+    for (i = 0; i < QWEN3_VOCAB; i++)
+        if (logits[i] > maximum)
+            maximum = logits[i];
+    for (i = 0; i < QWEN3_VOCAB; i++)
+        sum += exp((double)(logits[i] - (int64_t)maximum) / 65536.0);
+    return log(sum) + (double)((int64_t)maximum - logits[target]) / 65536.0;
+}
+
 int main(int argc, char **argv)
 {
     struct qwen3_engine engine = {0};
@@ -654,24 +699,36 @@ int main(int argc, char **argv)
     int32_t best_logit = 0;
     int layer, position, token_count = 0, generate_count = 1;
     int total_positions, emitted_count = 0, last_processed = -1;
-    int arg, rc = 1;
+    int arg, rc = 1, score_mode = 0;
+    double nll_sum = 0;
 
     if (argc < 3) {
         fprintf(stderr, "usage: %s model.safetensors token_id... [--generate count] [--dump-logits output.i32]\n"
-                        "   or: %s model.safetensors --tokenizer tokenizer.json --prompt text [--generate count] [--dump-logits output.i32]\n",
-                argv[0], argv[0]);
+                        "   or: %s model.safetensors --tokenizer tokenizer.json --prompt text [--generate count] [--dump-logits output.i32]\n"
+                        "   or: %s model.safetensors --tokenizer tokenizer.json --score-file text.txt\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     if (argc >= 6 && strcmp(argv[2], "--tokenizer") == 0 &&
-        strcmp(argv[4], "--prompt") == 0) {
+        (strcmp(argv[4], "--prompt") == 0 ||
+         strcmp(argv[4], "--score-file") == 0)) {
         size_t count;
+        char *text = NULL;
+        score_mode = strcmp(argv[4], "--score-file") == 0;
         tokenizer = qwen3_tokenizer_open(argv[3]);
+        if (score_mode && read_text_file(argv[5], &text)) {
+            fprintf(stderr, "could not read scoring text\n");
+            goto done;
+        }
         if (!tokenizer ||
-            qwen3_tokenizer_encode(tokenizer, argv[5], &token_ids, &count) ||
+            qwen3_tokenizer_encode(tokenizer, score_mode ? text : argv[5],
+                                   &token_ids, &count) ||
             !count || count > QWEN3_CONTEXT_LIMIT) {
+            free(text);
             fprintf(stderr, "could not encode prompt within model context\n");
             goto done;
         }
+        free(text);
         token_count = (int)count;
         report = stderr;
         arg = 6;
@@ -694,7 +751,8 @@ int main(int argc, char **argv)
             arg++;
         }
     }
-    if (arg < argc && strcmp(argv[arg], "--generate") == 0 && arg + 1 < argc) {
+    if (!score_mode && arg < argc && strcmp(argv[arg], "--generate") == 0 &&
+        arg + 1 < argc) {
         errno = 0;
         parsed_token = strtoul(argv[arg + 1], &endptr, 10);
         if (errno || endptr == argv[arg + 1] || *endptr ||
@@ -707,19 +765,20 @@ int main(int argc, char **argv)
         generate_count = (int)parsed_token;
         arg += 2;
     }
-    if (arg < argc && strcmp(argv[arg], "--dump-logits") == 0 &&
+    if (!score_mode && arg < argc && strcmp(argv[arg], "--dump-logits") == 0 &&
         arg + 1 < argc) {
         dump_path = argv[arg + 1];
         arg += 2;
     }
-    if (!token_count || arg != argc ||
-        generate_count > QWEN3_CONTEXT_LIMIT - token_count + 1) {
+    if (arg != argc || (score_mode && token_count < 2) || !token_count ||
+        (!score_mode && generate_count > QWEN3_CONTEXT_LIMIT - token_count + 1)) {
         fprintf(stderr, "expected token IDs and options within %d positions\n",
                 QWEN3_CONTEXT_LIMIT);
         rc = 2;
         goto done;
     }
-    total_positions = token_count + generate_count - 1;
+    total_positions = score_mode ? token_count - 1 :
+        token_count + generate_count - 1;
     {
         uint32_t *resized = realloc(token_ids,
                                      ((size_t)total_positions + 1) * sizeof(*token_ids));
@@ -818,12 +877,14 @@ int main(int argc, char **argv)
             kernel_vector(&engine, 0, hidden, down,
                           QWEN3_HIDDEN_SIZE, hidden))
             goto layer_fail;
-        fprintf(report, "position %d/%d layer %d/%d complete (%.3f s)\n",
-               position + 1, total_positions, layer + 1, QWEN3_LAYERS,
-               elapsed(&start));
-        fflush(report);
+        if (!score_mode) {
+            fprintf(report, "position %d/%d layer %d/%d complete (%.3f s)\n",
+                   position + 1, total_positions, layer + 1, QWEN3_LAYERS,
+                   elapsed(&start));
+            fflush(report);
         }
-        if (position < token_count - 1)
+        }
+        if (!score_mode && position < token_count - 1)
             continue;
         engine.batch_work->track_argmax = 1;
         engine.batch_work->best_q16 = INT32_MIN;
@@ -839,6 +900,10 @@ int main(int argc, char **argv)
         next_id = engine.batch_work->best_index;
         best_logit = (int32_t)engine.batch_work->best_q16;
         engine.batch_work->track_argmax = 0;
+        if (score_mode) {
+            nll_sum += next_token_nll(logits, token_ids[position + 1]);
+            continue;
+        }
         if (dump_path) {
         FILE *dump = fopen(dump_path, "wb");
         size_t written;
@@ -878,6 +943,13 @@ int main(int argc, char **argv)
             break;
         if (position + 1 < total_positions)
             token_ids[position + 1] = next_id;
+    }
+    if (score_mode) {
+        fprintf(report, "scored_tokens=%d nll_sum=%.9f perplexity=%.9f elapsed=%.3f s\n",
+                total_positions, nll_sum, exp(nll_sum / total_positions),
+                elapsed(&start));
+        rc = 0;
+        goto done;
     }
     if (tokenizer)
         fputc('\n', stdout);

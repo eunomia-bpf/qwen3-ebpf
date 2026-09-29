@@ -92,6 +92,25 @@ text supplied to `--prompt`; the CLI does not invent a chat template.
 Set `QWEN3_TRACE=1` for intermediate range diagnostics. The tokenizer is
 loaded from the official `tokenizer.json` at runtime; it is not vendored.
 
+To score every next token in a UTF-8 excerpt, rather than only generating from
+its final position, use:
+
+```sh
+./build/infer /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer.json --score-file excerpt.txt
+```
+
+This reports the number of scored tokens, summed negative log-likelihood,
+perplexity, and elapsed time. The first token supplies context and is not
+scored. The score is for the exact supplied token sequence, not for an entire
+benchmark corpus. To compare against the official BF16 model, place its
+`config.json` and `tokenizer_config.json` alongside the weights and tokenizer
+and run `python tests/reference_score.py MODEL_DIR excerpt.txt` in an
+environment with PyTorch and Transformers. Both commands use the same text;
+the reference runs on CPU, disables automatic special-token insertion, and
+scores the same next-token positions. Neither command attaches BPF to a live
+network or kernel event.
+
 ## Build and test targets
 
 | Target | Purpose |

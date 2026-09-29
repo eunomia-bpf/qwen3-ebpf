@@ -28,6 +28,16 @@ The default path converts active BF16 rows to Q24 in C. The optional BF16
 arena path moves that conversion into BPF for one batch at a time; neither
 path keeps the entire model in the arena.
 
+The operators use the `socket` BPF program type, but the driver runs them via
+`BPF_PROG_RUN`; it does not attach them to a socket or an XDP interface. An
+attached network hook could recognize a request, but moving the full model
+into the kernel also requires kernel-owned weights, a kernel-side scheduler
+for the bounded operator invocations, and a way to report completion. Merely
+changing the hook type does not provide those pieces. Running seconds of
+inference inline on the packet receive path would also make packet latency
+depend on model execution, so a live hook should not be treated as a full
+inference backend until those properties are demonstrated.
+
 | Kernel program | Role in full inference |
 | --- | --- |
 | `qwen3_batch.bpf.c` | Bounded matrix rows for Q/K/V, output, MLP, and vocabulary projection; tracks the winning vocabulary logit. |

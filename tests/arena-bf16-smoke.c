@@ -78,6 +78,46 @@ static int run_synthetic(struct qwen3_arena_bf16_bpf *skel,
     return 0;
 }
 
+static int run_resident_synthetic(struct qwen3_arena_bf16_bpf *skel,
+                                   struct qwen3_arena_bf16_work *work)
+{
+    struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
+    static const __u16 samples[] = {0x3d00, 0xbd00, 0x3c00, 0};
+    int row, col;
+
+    memset(work, 0, sizeof(*work));
+    work->model_elements = 256;
+    if (bpf_prog_test_run_opts(
+            bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
+            &opts) || opts.retval || !skel->bss->model_bf16) {
+        fprintf(stderr, "arena BF16 resident allocation failed\n");
+        return -1;
+    }
+    work->cols = 128;
+    work->resident_weights = 1;
+    for (col = 0; col < 128; col++)
+        work->input_q16[col] = ((col % 11) - 5) * 8192;
+    for (row = 0; row < 2; row++)
+        for (col = 0; col < 128; col++)
+            skel->bss->model_bf16[row * 128 + col] =
+                samples[(row + col) % 4];
+    if (run_kernel(skel, work, 2))
+        return -1;
+    for (row = 0; row < 2; row++) {
+        __s64 expected = 0;
+        for (col = 0; col < 128; col++) {
+            __u16 bits = skel->bss->model_bf16[row * 128 + col];
+            expected += (__s64)work->input_q16[col] *
+                        skel->arena->q24_by_bf16[bits];
+        }
+        if (work->output_q16[row] != expected >> 24) {
+            fprintf(stderr, "arena BF16 resident row %d mismatch\n", row);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int run_model_rows(struct qwen3_arena_bf16_bpf *skel,
                           struct qwen3_arena_bf16_work *work,
                           const char *path)
@@ -156,6 +196,7 @@ int main(int argc, char **argv)
     }
     populate_lut(skel);
     if (!run_synthetic(skel, work) &&
+        !run_resident_synthetic(skel, work) &&
         (argc == 1 || !run_model_rows(skel, work, argv[1]))) {
         puts("arena BF16 smoke passed");
         rc = 0;

@@ -35,11 +35,34 @@ Runs used Linux `6.17.0-1029-nvidia` on arm64. The BF16 reference was
 limited to four CPU cores with `OMP_NUM_THREADS=4`; the eBPF driver used its
 normal single-threaded operator dispatch. Both timings start *after* model
 loading. They are single runs, not a controlled throughput benchmark, and the
-CPU parallelism differs. The eBPF path is much slower here; there is no
-measured speed benefit. The eBPF perplexities are higher than BF16 on both
+CPU parallelism differs: the BF16 reference processes all positions in one
+teacher-forced forward pass while eBPF advances one position at a time. The
+timings therefore do not form a matched online-generation comparison. The
+eBPF path is much slower in this scoring setup; there is no measured speed
+benefit. The eBPF perplexities are higher than BF16 on both
 excerpts. This is a repeatable fixed-excerpt check, **not** whole-test-set
 perplexity, generation quality, or evidence that a live kernel event is useful.
 The model and tokenizer SHA-256 values are recorded below.
+
+### Resident BF16 arena (2026-09-29)
+
+On the same Linux 6.17 arm64 test host, the optional arena backend dynamically
+allocated pages for the official model's 1.5 GB tensor payload and copied it
+once during loading. The arena BPF operator then read matrix rows by their
+Safetensors offsets rather than receiving a new weight batch from C for each
+call. A two-row synthetic resident test and a 128-row official-weight operator
+test passed. Complete 28-layer runs for token `0`, a two-token `Hello`
+generation, and input IDs `0` through `9` produced the same generated IDs
+and byte-identical final 151,936-entry Q16 logit files as the default path.
+
+Single-run wall-clock measurements, including model loading, were 1.412 s
+(default) versus 2.176 s (resident) for one input token, and 7.573 s versus
+7.852 s for ten input tokens. The corresponding one-token forward-only times
+were 1.213 s and 1.089 s. These are exploratory runs under a shared-host
+load, not evidence of an end-to-end speedup: the resident path pays for arena
+allocation and copying up front, while C still dispatches every operator.
+It is not attached to a live socket or XDP hook, and the 28-layer schedule
+remains in user space.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
@@ -207,8 +230,9 @@ values. Three interleaved one-token runs on the same host measured
 for the lookup path. The latter produced byte-identical full-vocabulary Q16
 logits for token `0`, `Hello, world!`, and `[0, 1] --generate 2`. These are
 small exploratory samples, not a stable throughput or cross-host speed claim.
-The lookup table occupies about 512 KiB; weight conversion still happens in C
-for each active matrix row, not in BPF or in a resident weight arena.
+The lookup table occupies about 512 KiB. At that revision, weight conversion
+still happened in C for each active matrix row; the later resident arena path
+is measured separately above.
 
 Collapsing each RMSNorm from separate tile calls and three stages into a
 single BPF invocation reduced one-token `bpf` syscalls from 50,667 to

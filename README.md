@@ -13,8 +13,9 @@ additional token IDs. The KV cache lives in a BPF array map; the attention
 operator writes new K/V pairs and scans up to 256 prior positions per
 invocation using `bpf_loop`.
 The default host path loads and converts official BF16 weights, dispatches
-bounded BPF tiles, and reads results; an optional arena path instead passes
-BF16 rows to BPF for exact Q24 lookup. Model arithmetic and argmax run in eBPF. A C
+bounded BPF tiles, and reads results; an optional arena path instead preloads
+the model's BF16 payload into a BPF arena for exact Q24 lookup. Model arithmetic
+and argmax run in eBPF. A C
 ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
 data are distributed here.
 
@@ -60,8 +61,10 @@ flowchart LR
     D -->|next token| A
 ```
 
-C schedules multiple bounded BPF invocations, supplies embeddings and RoPE
-trigonometric inputs, and converts active BF16 weight rows to Q24. BPF performs
+C schedules multiple bounded BPF invocations and supplies embeddings and RoPE
+trigonometric inputs. On the default path, C converts active BF16 weight rows
+to Q24; on the optional resident path, BPF reads BF16 weights from its arena.
+BPF performs
 matrix operations, normalization, attention, MLP operations, and argmax.
 This is not a single long-running kernel program, a GPU profiler, or a
 user-space LLM called by an eBPF hook.
@@ -111,8 +114,9 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   drop-in inference replacements.
 - The KV cache costs about 224 KiB per requested position. The model's 40,960
   position limit is not a validated context capacity for this implementation.
-- Optional BF16 arena batches do not make the entire model kernel-resident.
-  Their recorded timings did not establish a stable speedup.
+- The optional BF16 arena keeps model weights in kernel memory, but C still
+  schedules every operator and handles text; no live network hook or
+  end-to-end speedup has been established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

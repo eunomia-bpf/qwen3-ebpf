@@ -44,12 +44,14 @@ check only. `ARENA_LIBBPF_INCLUDE`, `ARENA_UAPI_INCLUDE`, and
 `ARENA_LIBBPF` can point to an external recent libbpf build; the normal
 build does not need these dependencies.
 
-To build and run full-model inference with bounded BF16 arena batches on
-that newer toolchain, use `make build/infer-arena-bf16` and invoke it with
-the same arguments as `build/infer`. The model stays in the read-only
-Safetensors mapping; C copies each active BF16 batch into the arena, and BPF
-does the BF16-to-Q24 lookup and matrix dot. This is kernel-side weight access,
-not whole-model weight residency.
+To build and run full-model inference with resident BF16 weights on that newer
+toolchain, use `make build/infer-arena-bf16` and invoke it with the same
+arguments as `build/infer`. The loader copies the complete BF16 model payload
+into dynamically allocated BPF arena pages once; BPF reads matrix rows there
+and does the BF16-to-Q24 lookup and dot. Budget roughly another 1.5 GB of
+kernel memory for the official model, in addition to its file mapping and KV
+cache. C still selects operators, supplies embeddings and other small weights,
+and reads results, so this is not yet a user-space-free inference service.
 
 The test loads an ephemeral BPF program and map; it attaches to no network
 interface and installs nothing persistently.

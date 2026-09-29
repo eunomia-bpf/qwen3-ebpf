@@ -76,6 +76,8 @@ struct qwen3_engine {
     size_t arena_work_mapping_len;
     struct qwen3_arena_bf16_work *arena_work;
     uint8_t arena_weight_valid[UINT16_MAX + 1];
+    uint64_t arena_validated_first_bytes[256];
+    size_t arena_validated_count;
 #endif
 };
 
@@ -249,6 +251,24 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         engine->arena_skel->arena->q24_by_bf16[bits] =
             engine->arena_weight_valid[bits]
             ? (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5)) : 0;
+    }
+    {
+        size_t data_offset = 8 + (size_t)engine->model.header_length;
+        size_t bytes = engine->model.mapping_size - data_offset;
+        const uint8_t *raw = engine->model.mapping + data_offset;
+        struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
+
+        if ((bytes & 1) || bytes / 2 > QWEN3_ARENA_MODEL_MAX_BF16)
+            return -1;
+        engine->arena_work->model_elements = bytes / 2;
+        if (bpf_prog_test_run_opts(bpf_program__fd(
+                engine->arena_skel->progs.qwen3_arena_allocate_model),
+                &opts) || opts.retval || !engine->arena_skel->bss->model_bf16) {
+            fprintf(stderr, "could not allocate resident model arena\n");
+            return -1;
+        }
+        memcpy(engine->arena_skel->bss->model_bf16, raw, bytes);
+        engine->arena_work->resident_weights = 1;
     }
 #endif
     engine->batch_work = engine->batch_mapping;
@@ -455,6 +475,35 @@ static int kernel_attention_heads(struct qwen3_engine *engine,
 }
 
 #ifdef QWEN3_USE_ARENA_BF16
+static int validate_resident_matrix(struct qwen3_engine *engine,
+                                    const char *name, uint64_t first_byte,
+                                    int rows, int cols)
+{
+    const uint8_t *raw = engine->model.mapping + 8 +
+                         engine->model.header_length + first_byte;
+    size_t count = (size_t)rows * cols, i;
+
+    for (i = 0; i < engine->arena_validated_count; i++)
+        if (engine->arena_validated_first_bytes[i] == first_byte)
+            return 0;
+    if (engine->arena_validated_count ==
+        sizeof(engine->arena_validated_first_bytes) /
+        sizeof(engine->arena_validated_first_bytes[0]))
+        return -1;
+    for (i = 0; i < count; i++) {
+        uint16_t bits = (uint16_t)raw[2 * i] |
+                        (uint16_t)raw[2 * i + 1] << 8;
+        if (!engine->arena_weight_valid[bits]) {
+            fprintf(stderr, "matrix BF16 weight out of Q24 range for %s\n",
+                    name);
+            return -1;
+        }
+    }
+    engine->arena_validated_first_bytes[engine->arena_validated_count++] =
+        first_byte;
+    return 0;
+}
+
 static int kernel_matrix_arena(struct qwen3_engine *engine,
                                const char *name, uint64_t first_byte,
                                int rows, int cols, const int32_t *input,
@@ -464,7 +513,16 @@ static int kernel_matrix_arena(struct qwen3_engine *engine,
     struct qwen3_arena_bf16_bpf *skel = engine->arena_skel;
     int row, batch_row, i;
 
+    if ((first_byte & 1) ||
+        first_byte / 2 > work->model_elements ||
+        (uint64_t)rows * cols > work->model_elements - first_byte / 2 ||
+        validate_resident_matrix(engine, name, first_byte, rows, cols)) {
+        fprintf(stderr, "resident matrix metadata mismatch for %s\n", name);
+        return -1;
+    }
+
     work->cols = (uint32_t)cols;
+    work->weight_first_bf16 = first_byte / 2;
     work->track_argmax = engine->batch_work->track_argmax;
     work->best_q16 = engine->batch_work->best_q16;
     work->best_index = engine->batch_work->best_index;
@@ -478,23 +536,6 @@ static int kernel_matrix_arena(struct qwen3_engine *engine,
             ? rows - row : QWEN3_ARENA_BF16_ROWS);
         work->base_index = (uint32_t)row;
         work->completed = 0;
-        for (batch_row = 0; batch_row < (int)work->rows; batch_row++) {
-            uint16_t *weights = skel->arena->weight_bf16[batch_row];
-            if (safetensors_read_bf16_bits_at(&engine->model, first_byte,
-                    (uint64_t)(row + batch_row) * cols,
-                    (size_t)cols, weights)) {
-                fprintf(stderr, "matrix BF16 read failed for %s row %d\n",
-                        name, row + batch_row);
-                return -1;
-            }
-            for (i = 0; i < cols; i++) {
-                if (!engine->arena_weight_valid[weights[i]]) {
-                    fprintf(stderr, "matrix BF16 weight out of Q24 range for %s\n",
-                            name);
-                    return -1;
-                }
-            }
-        }
         if (call_kernel(bpf_program__fd(skel->progs.qwen3_arena_bf16_rows)) ||
             work->completed != work->rows) {
             fprintf(stderr, "arena BF16 matrix failed for %s row %d\n",

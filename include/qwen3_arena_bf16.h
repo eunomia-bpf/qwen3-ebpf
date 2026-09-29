@@ -14,6 +14,9 @@
 #define QWEN3_EVENT_RUNNING 2u
 #define QWEN3_EVENT_DONE 3u
 #define QWEN3_EVENT_ERROR 4u
+#define QWEN3_EVENT_STAGE_Q 1u
+#define QWEN3_EVENT_STAGE_K 2u
+#define QWEN3_EVENT_STAGE_V 3u
 
 struct qwen3_event_state {
     struct bpf_wq work;
@@ -40,13 +43,21 @@ struct qwen3_arena_bf16_work {
     __u32 matrix_total_rows;
     __u32 event_use_token;
     __u32 event_token_id;
+    __u32 event_qkv;
+    __u32 event_stage;
     __u32 embedding_vocab;
     __u64 embedding_first_bf16;
     __u64 norm_first_bf16;
+    __u64 q_first_bf16;
+    __u64 k_first_bf16;
+    __u64 v_first_bf16;
     __u64 norm_sum_sq_q32;
     __u64 norm_inv_rms_q16;
     __s32 embedding_q16[QWEN3_ARENA_TOKEN_WIDTH];
     __s32 matrix_output_q16[QWEN3_ARENA_EVENT_OUTPUTS];
+    __s32 query_q16[2048];
+    __s32 key_q16[QWEN3_ARENA_TOKEN_WIDTH];
+    __s32 value_q16[QWEN3_ARENA_TOKEN_WIDTH];
 };
 
 #endif

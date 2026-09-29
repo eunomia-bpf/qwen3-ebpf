@@ -104,6 +104,17 @@ This remains only the beginning of one decoder layer; the previous direct
 matrix timings do not include the embedding and RMSNorm work now present in
 the event path, so they are not a matched performance comparison.
 
+The event state machine now carries that normalized vector through the first
+layer's Q, K, and V projections without a user-space dispatch between the
+32 matrix batches. Ten alternating real-token requests matched separate C
+Q24 reference results for all 4,096 projection rows per request. In one
+shared-host run, the 32 direct `BPF_PROG_RUN` matrix calls had a median of
+4.034 ms; packet-to-result observation had a median of 4.200 ms (4.126 ms
+from XDP to completion by BPF timestamps). The direct timing excludes
+embedding and normalization, so these are not matched full-request timings
+and do not establish a speedup. Q/K norm, RoPE, attention, MLP, later layers,
+and final-token delivery remain outside this event path.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

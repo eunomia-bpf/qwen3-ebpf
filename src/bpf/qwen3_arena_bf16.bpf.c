@@ -144,7 +144,20 @@ static long store_output_row(__u32 row, void *ctx)
         *(__u32 *)ctx = 1;
         return 1;
     }
-    state->matrix_output_q16[index] = (__s32)output;
+    if (!state->event_qkv)
+        state->matrix_output_q16[index] = (__s32)output;
+    else if (state->event_stage == QWEN3_EVENT_STAGE_Q && index < 2048)
+        state->query_q16[index] = (__s32)output;
+    else if (state->event_stage == QWEN3_EVENT_STAGE_K &&
+             index < QWEN3_ARENA_TOKEN_WIDTH)
+        state->key_q16[index] = (__s32)output;
+    else if (state->event_stage == QWEN3_EVENT_STAGE_V &&
+             index < QWEN3_ARENA_TOKEN_WIDTH)
+        state->value_q16[index] = (__s32)output;
+    else {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
     return 0;
 }
 
@@ -258,11 +271,15 @@ static int event_callback(void *map, int *key, void *value)
     base = state->base_index;
     rows = state->rows;
     if (total > QWEN3_ARENA_EVENT_OUTPUTS || base >= total ||
-        rows > total - base) {
+        rows > total - base ||
+        (state->event_qkv &&
+         (state->event_stage < QWEN3_EVENT_STAGE_Q ||
+          state->event_stage > QWEN3_EVENT_STAGE_V))) {
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
-    if (state->event_use_token && base == 0) {
+    if (state->event_use_token && base == 0 &&
+        (!state->event_qkv || state->event_stage == QWEN3_EVENT_STAGE_Q)) {
         if (state->cols != QWEN3_ARENA_TOKEN_WIDTH ||
             state->event_token_id >= state->embedding_vocab ||
             state->embedding_first_bf16 > state->model_elements ||
@@ -314,6 +331,24 @@ static int event_callback(void *map, int *key, void *value)
     }
     base += rows;
     if (base == total) {
+        if (state->event_qkv && state->event_stage < QWEN3_EVENT_STAGE_V) {
+            if (state->event_stage == QWEN3_EVENT_STAGE_Q) {
+                state->event_stage = QWEN3_EVENT_STAGE_K;
+                state->weight_first_bf16 = state->k_first_bf16;
+            } else if (state->event_stage == QWEN3_EVENT_STAGE_K) {
+                state->event_stage = QWEN3_EVENT_STAGE_V;
+                state->weight_first_bf16 = state->v_first_bf16;
+            } else {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->matrix_total_rows = QWEN3_ARENA_TOKEN_WIDTH;
+            state->base_index = 0;
+            state->rows = QWEN3_ARENA_BF16_ROWS;
+            if (bpf_wq_start(&job->work, 0))
+                job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
         state->base_index = base;
         job->finish_ns = bpf_ktime_get_ns();
         job->completed_requests++;
@@ -397,6 +432,11 @@ int qwen3_event_xdp(struct xdp_md *ctx)
         return XDP_PASS;
     state->base_index = 0;
     state->event_token_id = token_id;
+    if (state->event_qkv) {
+        state->event_stage = QWEN3_EVENT_STAGE_Q;
+        state->weight_first_bf16 = state->q_first_bf16;
+        state->matrix_total_rows = 2048;
+    }
     if (state->matrix_total_rows)
         state->rows = state->matrix_total_rows < QWEN3_ARENA_BF16_ROWS ?
             state->matrix_total_rows : QWEN3_ARENA_BF16_ROWS;

@@ -115,10 +115,11 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
 - The KV cache costs about 224 KiB per requested position. The model's 40,960
   position limit is not a validated context capacity for this implementation.
 - The optional BF16 arena keeps model weights in kernel memory. A separate
-  XDP-to-BPF-workqueue path can schedule all batches of one real-weight matrix
-  from a live packet, including repeated requests. C still schedules the 28
-  layers in full inference and handles text. No full-model event path or
-  end-to-end speedup has been established.
+  XDP-to-BPF-workqueue path accepts token IDs from live packets, loads their
+  embeddings from resident weights, and schedules all batches of one real-weight
+  matrix, including repeated requests. C still schedules the 28 layers in full
+  inference and handles text. No full-model event path or end-to-end speedup
+  has been established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

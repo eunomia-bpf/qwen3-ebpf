@@ -81,6 +81,18 @@ boundaries and the host was not isolated. This establishes neither a speedup
 nor complete model inference; the loader still supplies activations, and the
 28-layer schedule is in C.
 
+A follow-up test moved the activation source into BPF: each packet supplied
+token ID `0` or the final valid ID `151935`, and the work item read the
+corresponding 1,024-element embedding from a resident copy of the official
+embedding tensor before the same Q-projection. Ten alternating requests passed
+exact Q16 embedding and
+2,048-output Q24 comparisons with C; invalid magic and out-of-range token IDs
+did not start work. One shared-host run gave median 2.085 ms for the
+user-dispatched matrix batches and 2.158 ms for packet-to-result observation
+(2.092 ms by BPF timestamps). These are small, non-isolated samples with
+different timing boundaries, not evidence of a reliable speedup. This test
+does not apply RMSNorm or execute the remaining decoder layers.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

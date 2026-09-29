@@ -37,7 +37,7 @@ help:
 	  'make build/infer-arena-bf16      Build optional arena inference' \
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
 	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
-	  'make test-arena-xdp-model MODEL=... Run real-weight multi-batch XDP matrix check' \
+	  'make test-arena-xdp-model MODEL=... Run token-driven real-weight XDP matrix check' \
 	  'make test-arena-int4 [MODEL=...] Run optional arena INT4 checks' \
 	  'make clean           Remove build outputs'
 

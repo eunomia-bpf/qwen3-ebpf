@@ -7,6 +7,7 @@
 #define QWEN3_ARENA_BF16_ROWS 128
 #define QWEN3_ARENA_BF16_COLS 3072
 #define QWEN3_ARENA_EVENT_OUTPUTS 3072
+#define QWEN3_ARENA_TOKEN_WIDTH 1024
 #define QWEN3_ARENA_MODEL_MAX_BF16 (768u * 1024u * 1024u)
 
 #define QWEN3_EVENT_READY 1u
@@ -37,6 +38,10 @@ struct qwen3_arena_bf16_work {
     __u64 model_elements;
     __u32 resident_weights;
     __u32 matrix_total_rows;
+    __u32 event_use_token;
+    __u32 event_token_id;
+    __u32 embedding_vocab;
+    __u64 embedding_first_bf16;
     __s32 matrix_output_q16[QWEN3_ARENA_EVENT_OUTPUTS];
 };
 

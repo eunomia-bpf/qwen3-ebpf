@@ -34,8 +34,10 @@ runs them via `BPF_PROG_RUN`; it does not attach the full-model schedule to a
 socket or XDP interface. The optional arena object now has a separate XDP
 entrypoint: a matching UDP packet queues a BPF work item that advances through
 all batches of one resident-weight matrix, and the test reads its result from
-a BPF map. The callback requeues itself until all rows finish, without C
-dispatching each batch. This keeps the receive hook short, but the 28-layer
+a BPF map. In the real-weight test, the packet supplies a token ID and the
+work item first reads its embedding from resident weights. The callback
+requeues itself until all rows finish, without C dispatching each batch.
+This keeps the receive hook short, but the 28-layer
 scheduler and final-token result delivery are not yet kernel-owned. Merely
 changing the hook type does not provide those pieces, and full inference must
 not run inline in XDP.

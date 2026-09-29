@@ -22,6 +22,7 @@ struct {
 
 __u16 __arena weight_bf16[QWEN3_ARENA_BF16_ROWS][QWEN3_ARENA_BF16_COLS];
 __s32 __arena q24_by_bf16[1 << 16];
+__s32 __arena q16_by_bf16[1 << 16];
 __u16 __arena *model_bf16;
 
 extern void *bpf_arena_alloc_pages(void *map, void *addr, __u32 page_cnt,
@@ -146,6 +147,31 @@ static long store_output_row(__u32 row, void *ctx)
     return 0;
 }
 
+static long load_token_embedding(__u32 col, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u64 first;
+    __u32 bounded_col = col & (QWEN3_ARENA_TOKEN_WIDTH - 1);
+    __u16 bits;
+
+    if (!state || !model_bf16 ||
+        state->event_token_id >= state->embedding_vocab) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    first = state->embedding_first_bf16 +
+            (__u64)state->event_token_id * QWEN3_ARENA_TOKEN_WIDTH + bounded_col;
+    if (first >= state->model_elements) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    bits = model_bf16[first];
+    state->input_q16[bounded_col] =
+        q16_by_bf16[bits];
+    return 0;
+}
+
 static int event_callback(void *map, int *key, void *value)
 {
     const __u32 work_key = 0;
@@ -169,6 +195,22 @@ static int event_callback(void *map, int *key, void *value)
         rows > total - base) {
         job->status = QWEN3_EVENT_ERROR;
         return 0;
+    }
+    if (state->event_use_token && base == 0) {
+        if (state->cols != QWEN3_ARENA_TOKEN_WIDTH ||
+            state->event_token_id >= state->embedding_vocab ||
+            state->embedding_first_bf16 > state->model_elements ||
+            (__u64)state->embedding_vocab * QWEN3_ARENA_TOKEN_WIDTH >
+                state->model_elements - state->embedding_first_bf16) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        bpf_loop(QWEN3_ARENA_TOKEN_WIDTH, load_token_embedding,
+                 &callback_ctx, 0);
+        if (callback_ctx) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
     }
     state->completed = 0;
     bpf_loop(rows, compute_row, &callback_ctx, 0);
@@ -223,7 +265,9 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     unsigned char *payload;
     const __u32 key = 0;
     struct qwen3_event_state *job;
+    struct qwen3_arena_bf16_work *state;
     __u64 old_status;
+    __u32 token_id = 0;
 
     if ((void *)(eth + 1) > end || eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
@@ -238,6 +282,18 @@ int qwen3_event_xdp(struct xdp_md *ctx)
         payload[0] != 'Q' || payload[1] != '3' ||
         payload[2] != 'B' || payload[3] != 'P')
         return XDP_PASS;
+    state = bpf_map_lookup_elem(&work, &key);
+    if (!state)
+        return XDP_PASS;
+    if (state->event_use_token) {
+        if (payload + 8 > (unsigned char *)end)
+            return XDP_PASS;
+        token_id = ((__u32)payload[4] << 24) |
+                   ((__u32)payload[5] << 16) |
+                   ((__u32)payload[6] << 8) | payload[7];
+        if (token_id >= state->embedding_vocab)
+            return XDP_PASS;
+    }
     job = bpf_map_lookup_elem(&event, &key);
     if (!job)
         return XDP_PASS;
@@ -251,19 +307,11 @@ int qwen3_event_xdp(struct xdp_md *ctx)
                                       QWEN3_EVENT_RUNNING) !=
                                       QWEN3_EVENT_DONE))
         return XDP_PASS;
-    {
-        struct qwen3_arena_bf16_work *state =
-            bpf_map_lookup_elem(&work, &key);
-
-        if (!state) {
-            job->status = QWEN3_EVENT_ERROR;
-            return XDP_PASS;
-        }
-        state->base_index = 0;
-        if (state->matrix_total_rows)
-            state->rows = state->matrix_total_rows < QWEN3_ARENA_BF16_ROWS ?
-                state->matrix_total_rows : QWEN3_ARENA_BF16_ROWS;
-    }
+    state->base_index = 0;
+    state->event_token_id = token_id;
+    if (state->matrix_total_rows)
+        state->rows = state->matrix_total_rows < QWEN3_ARENA_BF16_ROWS ?
+            state->matrix_total_rows : QWEN3_ARENA_BF16_ROWS;
     job->requests++;
     job->start_ns = bpf_ktime_get_ns();
     job->finish_ns = 0;

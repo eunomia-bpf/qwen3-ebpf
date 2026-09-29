@@ -23,7 +23,7 @@ ARENA_INCLUDES := $(INCLUDES) -Ibuild -I$(ARENA_LIBBPF_INCLUDE) -I$(ARENA_UAPI_I
 ARENA_STEMS := build/qwen3_arena_int4 build/qwen3_arena_bf16
 
 .DEFAULT_GOAL := all
-.PHONY: all help experiments test test-model test-tokenizer test-arena-int4 test-arena-bf16 test-arena-xdp test-arena-xdp-model clean
+.PHONY: all help experiments test test-model test-tokenizer test-arena-int4 test-arena-bf16 test-arena-xdp test-arena-xdp-model test-arena-xdp-attention clean
 
 # The default build is the working inference path, not the experiment suite.
 all: build/infer $(BPF_OBJECTS)
@@ -38,6 +38,7 @@ help:
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
 	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
 	  'make test-arena-xdp-model MODEL=... Run token-driven real-weight XDP matrix check' \
+	  'make test-arena-xdp-attention MODEL=... Run two-token XDP attention and KV-cache check' \
 	  'make test-arena-int4 [MODEL=...] Run optional arena INT4 checks' \
 	  'make clean           Remove build outputs'
 
@@ -114,6 +115,10 @@ test-arena-xdp: build/arena-bf16-smoke
 test-arena-xdp-model: build/arena-bf16-smoke
 	test -n "$(MODEL)"
 	./build/arena-bf16-smoke --xdp-model "$(MODEL)"
+
+test-arena-xdp-attention: build/arena-bf16-smoke
+	test -n "$(MODEL)"
+	./build/arena-bf16-smoke --xdp-attention "$(MODEL)"
 
 clean:
 	$(RM) -r build

@@ -118,9 +118,10 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   XDP-to-BPF-workqueue path accepts token IDs from live packets, loads their
   embeddings and first-layer RMSNorm weights from resident storage, and
   schedules all batches of the real-weight first-layer Q/K/V projections,
-  then applies head-wise Q/K RMSNorm and position-dependent RoPE in the
-  workqueue, including repeated requests. C still schedules the 28 layers in
-  full inference and handles text. No full-model event path or end-to-end
+  then applies head-wise Q/K RMSNorm and position-dependent RoPE. A separate
+  event check also stores first-layer K/V in a kernel map and computes
+  attention over consecutive token packets. C still schedules the 28 layers
+  in full inference and handles text. No full-model event path or end-to-end
   speedup has been established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.

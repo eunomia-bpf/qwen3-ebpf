@@ -8,6 +8,7 @@
 #define QWEN3_ARENA_BF16_COLS 3072
 #define QWEN3_ARENA_EVENT_OUTPUTS 3072
 #define QWEN3_ARENA_TOKEN_WIDTH 1024
+#define QWEN3_EVENT_KV_LIMIT 256
 #define QWEN3_ARENA_MODEL_MAX_BF16 (768u * 1024u * 1024u)
 
 #define QWEN3_EVENT_READY 1u
@@ -17,6 +18,7 @@
 #define QWEN3_EVENT_STAGE_Q 1u
 #define QWEN3_EVENT_STAGE_K 2u
 #define QWEN3_EVENT_STAGE_V 3u
+#define QWEN3_EVENT_STAGE_ATTENTION 4u
 
 struct qwen3_event_state {
     struct bpf_wq work;
@@ -45,7 +47,10 @@ struct qwen3_arena_bf16_work {
     __u32 event_token_id;
     __u32 event_qkv;
     __u32 event_rope;
+    __u32 event_attention;
     __u32 event_position;
+    __u32 event_next_position;
+    __u32 attention_past_cursor;
     __u32 event_stage;
     __u32 embedding_vocab;
     __u64 embedding_first_bf16;
@@ -59,6 +64,10 @@ struct qwen3_arena_bf16_work {
     __u64 norm_inv_rms_q16;
     __u32 completed_qk_heads;
     __u32 completed_rope_heads;
+    __u32 completed_attention_heads;
+    __u32 attention_seen[16];
+    __s32 attention_max_score_q16[16];
+    __u64 attention_mass_q16[16];
     __s32 rope_cosine_q20[64];
     __s32 rope_sine_q20[64];
     __s32 embedding_q16[QWEN3_ARENA_TOKEN_WIDTH];
@@ -66,6 +75,7 @@ struct qwen3_arena_bf16_work {
     __s32 query_q16[2048];
     __s32 key_q16[QWEN3_ARENA_TOKEN_WIDTH];
     __s32 value_q16[QWEN3_ARENA_TOKEN_WIDTH];
+    __s32 attention_output_q16[2048];
 };
 
 #endif

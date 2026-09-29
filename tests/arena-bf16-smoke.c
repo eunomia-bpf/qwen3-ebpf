@@ -12,6 +12,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "qwen3_arena_bf16.h"
+#include "qwen3_attention.h"
 #include "qwen3_arena_bf16.skel.h"
 #include "safetensors.h"
 
@@ -70,6 +71,20 @@ static uint64_t reference_isqrt64(uint64_t value)
         root |= 1;
     }
     return root;
+}
+
+static uint64_t reference_exp_negative_q32(uint32_t delta_q16)
+{
+    uint64_t result;
+
+    if (!delta_q16)
+        return 1ULL << 32;
+    if (delta_q16 >= (16U << 16))
+        return 0;
+    result = (1ULL << 32) - ((uint64_t)delta_q16 << 6);
+    for (int i = 0; i < 10; i++)
+        result = (result * result) >> 32;
+    return result;
 }
 
 static int run_synthetic(struct qwen3_arena_bf16_bpf *skel,
@@ -150,7 +165,8 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                          const int32_t *expected_embeddings,
                          const uint32_t *token_ids,
                          const int32_t *expected_cosine,
-                         const int32_t *expected_sine)
+                         const int32_t *expected_sine,
+                         const int32_t *expected_attention)
 {
     const __u32 key = 0;
     unsigned char payload[12] = {'Q', '3', 'B', 'P'};
@@ -231,15 +247,37 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
             goto done;
         }
     }
+    if (work->event_attention) {
+        payload[4] = payload[5] = payload[6] = payload[7] = 0;
+        payload[8] = payload[9] = payload[10] = 0;
+        payload[11] = 2;
+        if (sendto(fd, payload, sizeof(payload), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) ||
+            bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+            job.status != QWEN3_EVENT_READY || job.requests != 0) {
+            fprintf(stderr, "non-contiguous position started attention\n");
+            goto done;
+        }
+        payload[10] = 1;
+        payload[11] = 0;
+        if (sendto(fd, payload, sizeof(payload), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) ||
+            bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+            job.status != QWEN3_EVENT_READY || job.requests != 0) {
+            fprintf(stderr, "out-of-cache position started attention\n");
+            goto done;
+        }
+    }
     for (attempt = 0; attempt < 10; attempt++) {
+        uint32_t scenario = attempt % (work->event_attention ? 2u : 4u);
         uint32_t expected_stride = work->event_qkv ? 4096 : total;
         const int32_t *request_expected = expected +
-            (work->event_rope ? (attempt % 4) * expected_stride :
+            (work->event_rope ? scenario * expected_stride :
              work->event_use_token ? (attempt % 2) * expected_stride : 0);
         uint32_t token_id = work->event_use_token ? token_ids[attempt % 2] : 0;
         size_t payload_size = work->event_rope ? 12 :
                               work->event_use_token ? 8 : 4;
-        uint32_t position = rope_positions[attempt % 4];
+        uint32_t position = rope_positions[scenario];
 
         payload[4] = (unsigned char)(token_id >> 24);
         payload[5] = (unsigned char)(token_id >> 16);
@@ -289,11 +327,17 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         if (job.status != QWEN3_EVENT_DONE || job.requests != attempt + 1 ||
             job.completed_requests != attempt + 1 ||
             job.finish_ns < job.start_ns ||
-            (work->event_qkv && work->event_stage != QWEN3_EVENT_STAGE_V) ||
+            (work->event_qkv && work->event_stage !=
+             (work->event_attention ? QWEN3_EVENT_STAGE_ATTENTION :
+                                      QWEN3_EVENT_STAGE_V)) ||
             (work->event_qkv && work->completed_qk_heads != 24) ||
             (work->event_rope &&
              (work->completed_rope_heads != 24 ||
               work->event_position != position)) ||
+            (work->event_attention &&
+             (work->completed_attention_heads != 16 ||
+              work->attention_past_cursor != position + 1 ||
+              work->event_next_position != position + 1)) ||
             work->base_index != (work->event_qkv ?
                 QWEN3_ARENA_TOKEN_WIDTH : total) ||
             work->completed != ((total - 1) % QWEN3_ARENA_BF16_ROWS + 1)) {
@@ -305,14 +349,14 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         if (work->event_rope) {
             for (i = 0; i < 64; i++) {
                 if (work->rope_cosine_q20[i] !=
-                        expected_cosine[(attempt % 4) * 64 + i] ||
+                        expected_cosine[scenario * 64 + i] ||
                     work->rope_sine_q20[i] !=
-                        expected_sine[(attempt % 4) * 64 + i]) {
+                        expected_sine[scenario * 64 + i]) {
                     fprintf(stderr, "XDP RoPE coefficient %u mismatch at position %u: cos=%d/%d sin=%d/%d\n",
                             i, position, work->rope_cosine_q20[i],
-                            expected_cosine[(attempt % 4) * 64 + i],
+                            expected_cosine[scenario * 64 + i],
                             work->rope_sine_q20[i],
-                            expected_sine[(attempt % 4) * 64 + i]);
+                            expected_sine[scenario * 64 + i]);
                     goto done;
                 }
             }
@@ -329,6 +373,58 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                         i, observed, request_expected[i]);
                 goto done;
             }
+        }
+        if (work->event_attention) {
+            if (!position) {
+                for (uint32_t head = 0; head < 16; head++) {
+                    int64_t dot = 0;
+
+                    for (i = 0; i < 128; i++)
+                        dot += (int64_t)request_expected[head * 128 + i] *
+                            request_expected[2048 + (head / 2) * 128 + i];
+                    int64_t score = ((dot >> 16) * 5793) >> 16;
+                    if (work->attention_max_score_q16[head] != score) {
+                        fprintf(stderr, "XDP attention position 0 head %u score mismatch: BPF=%d C=%lld\n",
+                                head, work->attention_max_score_q16[head],
+                                (long long)score);
+                        goto done;
+                    }
+                }
+            }
+            for (uint32_t kv_head = 0; kv_head < 8; kv_head++) {
+                uint32_t slot = position * 8 + kv_head;
+                struct qwen3_kv_pair pair;
+
+                if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event_kv),
+                                        &slot, &pair))
+                    goto done;
+                for (i = 0; i < 128; i++) {
+                    if (pair.key_q16[i] !=
+                            request_expected[2048 + kv_head * 128 + i] ||
+                        pair.value_q16[i] !=
+                            request_expected[3072 + kv_head * 128 + i]) {
+                        fprintf(stderr, "XDP cached KV mismatch at position %u head %u col %u\n",
+                                position, kv_head, i);
+                        goto done;
+                    }
+                }
+            }
+            for (i = 0; i < 2048; i++) {
+                int32_t observed = work->attention_output_q16[i];
+                int32_t wanted = expected_attention[scenario * 2048 + i];
+
+                if (observed != wanted) {
+                    fprintf(stderr, "XDP attention position %u row %u mismatch: BPF=%d C=%d\n",
+                            position, i, observed, wanted);
+                    goto done;
+                }
+            }
+            for (i = 0; i < 16; i++)
+                if (work->attention_seen[i] != position + 1) {
+                    fprintf(stderr, "XDP attention head %u saw %u positions\n",
+                            i, work->attention_seen[i]);
+                    goto done;
+                }
         }
         if (work->event_use_token) {
             for (i = 0; i < QWEN3_ARENA_TOKEN_WIDTH; i++) {
@@ -351,6 +447,18 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         printf("XDP request %u -> %u resident projection rows: host %.3f ms, kernel %.3f ms\n",
                attempt + 1, expected_stride, (double)elapsed_ns / 1000000.0,
                (double)(job.finish_ns - job.start_ns) / 1000000.0);
+        if (work->event_attention && attempt == 0) {
+            payload[8] = payload[9] = payload[10] = 0;
+            payload[11] = 2;
+            if (sendto(fd, payload, 12, 0, (struct sockaddr *)&dst,
+                       sizeof(dst)) != 12 ||
+                bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+                job.status != QWEN3_EVENT_DONE || job.requests != 1 ||
+                job.completed_requests != 1) {
+                fprintf(stderr, "skipped attention position started work\n");
+                goto done;
+            }
+        }
     }
     rc = 0;
 done:
@@ -360,9 +468,62 @@ done:
     return rc;
 }
 
+static int reference_two_token_attention(const int32_t qkv[4][4096],
+                                         int32_t output[2][2048])
+{
+    double max_error = 0;
+
+    for (int head = 0; head < 16; head++) {
+        int qbase = head * 128;
+        int kbase = 2048 + (head / 2) * 128;
+        int vbase = 3072 + (head / 2) * 128;
+        int64_t dot[2] = {0}, score[2], delta;
+        uint64_t mass, weight, alpha_q24;
+        double probability;
+
+        for (int i = 0; i < 128; i++) {
+            int64_t query = qkv[1][qbase + i];
+
+            output[0][qbase + i] = qkv[0][vbase + i];
+            dot[0] += query * qkv[0][kbase + i];
+            dot[1] += query * qkv[1][kbase + i];
+        }
+        for (int past = 0; past < 2; past++) {
+            score[past] = ((dot[past] >> 16) * 5793) >> 16;
+            if (score[past] > INT32_MAX || score[past] < INT32_MIN)
+                return -1;
+        }
+        delta = score[1] - score[0];
+        if (delta > 0) {
+            mass = reference_exp_negative_q32((uint32_t)delta) >> 16;
+            weight = 1ULL << 16;
+        } else {
+            mass = 1ULL << 16;
+            weight = reference_exp_negative_q32((uint32_t)-delta) >> 16;
+        }
+        alpha_q24 = (weight << 24) / (mass + weight);
+        probability = 1.0 / (1.0 + exp((double)(dot[0] - dot[1]) /
+                            (65536.0 * 65536.0 * sqrt(128.0))));
+        for (int i = 0; i < 128; i++) {
+            int64_t first = qkv[0][vbase + i];
+            int64_t second = qkv[1][vbase + i];
+            double exact = first + probability * (second - first);
+            double error;
+
+            output[1][qbase + i] = (int32_t)(first +
+                (((second - first) * (int64_t)alpha_q24) >> 24));
+            error = fabs((output[1][qbase + i] - exact) / 65536.0);
+            if (error > max_error)
+                max_error = error;
+        }
+    }
+    printf("first-layer two-token attention max_abs_error=%.9g\n", max_error);
+    return max_error <= 0.005 ? 0 : -1;
+}
+
 static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                          struct qwen3_arena_bf16_work *work,
-                         const char *path)
+                         const char *path, int with_attention)
 {
     struct safetensors_file file;
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
@@ -373,7 +534,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     int32_t q24[1024], hidden[2][1024], normalized[2][1024];
     int32_t norm_q20[1024], head_norm_q20[2][128];
     int32_t expected[2][4096], norm_expected[2][4096];
-    int32_t event_expected[4][4096];
+    int32_t event_expected[4][4096], attention_expected[2][2048];
     int32_t rope_cosine[4][64], rope_sine[4][64];
     int32_t direct_outputs[4096];
     float embedding[1024], norm_weights[1024], head_norm_weights[2][128];
@@ -467,6 +628,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     work->event_use_token = 1;
     work->event_qkv = 1;
     work->event_rope = 1;
+    work->event_attention = with_attention;
     for (col = 0; col < 1024; col++) {
         double scaled = (double)norm_weights[col] * 1048576.0;
 
@@ -574,6 +736,9 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             }
         }
     }
+    if (with_attention &&
+        reference_two_token_attention(event_expected, attention_expected))
+        goto done;
     for (int attempt = 0; attempt < 10; attempt++) {
         struct timespec begin, end;
         __s64 elapsed_ns;
@@ -612,7 +777,8 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     }
     rc = run_xdp_event(skel, work, &event_expected[0][0], 2048,
                        &normalized[0][0], &hidden[0][0], token_ids,
-                       &rope_cosine[0][0], &rope_sine[0][0]);
+                       &rope_cosine[0][0], &rope_sine[0][0],
+                       with_attention ? &attention_expected[0][0] : NULL);
 done:
     safetensors_close(&file);
     return rc;
@@ -682,7 +848,8 @@ int main(int argc, char **argv)
     int rc = 1;
     int32_t expected[2];
 
-    if (argc > 3 || (argc == 3 && strcmp(argv[1], "--xdp-model")))
+    if (argc > 3 || (argc == 3 && strcmp(argv[1], "--xdp-model") &&
+                      strcmp(argv[1], "--xdp-attention")))
         return 2;
     skel = qwen3_arena_bf16_bpf__open_and_load();
     if (!skel) {
@@ -697,8 +864,11 @@ int main(int argc, char **argv)
     }
     populate_lut(skel);
     if (argc == 3) {
-        if (!run_xdp_model(skel, work, argv[2])) {
-            puts("arena BF16 XDP model smoke passed");
+        int with_attention = !strcmp(argv[1], "--xdp-attention");
+
+        if (!run_xdp_model(skel, work, argv[2], with_attention)) {
+            puts(with_attention ? "arena BF16 XDP attention smoke passed" :
+                                  "arena BF16 XDP model smoke passed");
             rc = 0;
         }
         goto unmap;
@@ -710,7 +880,7 @@ int main(int argc, char **argv)
         if (argc == 1 ||
             (strcmp(argv[1], "--xdp-loopback") == 0 ?
              !run_xdp_event(skel, work, expected, 2, NULL, NULL, NULL,
-                            NULL, NULL) :
+                            NULL, NULL, NULL) :
              !run_model_rows(skel, work, argv[1]))) {
             puts("arena BF16 smoke passed");
             rc = 0;

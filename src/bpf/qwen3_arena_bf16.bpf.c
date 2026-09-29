@@ -6,6 +6,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include "qwen3_arena_bf16.h"
+#include "qwen3_attention.h"
 
 #define __arena __attribute__((address_space(1)))
 
@@ -68,6 +69,13 @@ struct {
     __type(key, __u32);
     __type(value, struct qwen3_event_state);
 } event SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, QWEN3_EVENT_KV_LIMIT * QWEN3_ATTENTION_KV_HEADS);
+    __type(key, __u32);
+    __type(value, struct qwen3_kv_pair);
+} event_kv SEC(".maps");
 
 static long compute_row(__u32 row, void *ctx)
 {
@@ -415,6 +423,141 @@ static long event_rope_head(__u32 head, void *ctx)
     return 0;
 }
 
+static __always_inline __u64 event_exp_negative_q32(__u32 delta_q16)
+{
+    __u64 result;
+    int i;
+
+    if (!delta_q16)
+        return 1ULL << 32;
+    if (delta_q16 >= (16U << 16))
+        return 0;
+    result = (1ULL << 32) - ((__u64)delta_q16 << 6);
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 10; i++)
+        result = (result * result) >> 32;
+    return result;
+}
+
+static __always_inline __u32 event_q_slot(__u32 base, __u32 offset)
+{
+    __u32 index = base + offset;
+
+    asm volatile ("" : "+r"(index));
+    return index & 2047;
+}
+
+static long event_store_kv_head(__u32 head, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_head = head & 7;
+    __u32 slot;
+    struct qwen3_kv_pair *pair;
+    int i;
+
+    if (!state || head >= QWEN3_ATTENTION_KV_HEADS ||
+        state->event_position >= QWEN3_EVENT_KV_LIMIT) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    slot = state->event_position * QWEN3_ATTENTION_KV_HEADS + bounded_head;
+    pair = bpf_map_lookup_elem(&event_kv, &slot);
+    if (!pair) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __u32 index = bounded_head * 128 + i;
+
+        asm volatile ("" : "+r"(index));
+        index &= QWEN3_ARENA_TOKEN_WIDTH - 1;
+        pair->key_q16[i] = state->key_q16[index];
+        pair->value_q16[i] = state->value_q16[index];
+    }
+    return 0;
+}
+
+static long event_attention_head(__u32 head, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_head = head;
+    __u32 base, kv_head, slot, past;
+    struct qwen3_kv_pair *pair;
+    __s64 dot = 0, score, delta;
+    __u64 mass, weight, new_mass, alpha_q24;
+    int i;
+
+    asm volatile ("" : "+r"(bounded_head));
+    bounded_head &= 15;
+    if (!state || head >= 16 ||
+        state->event_position >= QWEN3_EVENT_KV_LIMIT ||
+        state->attention_past_cursor > state->event_position) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    base = bounded_head * 128;
+    kv_head = bounded_head >> 1;
+    past = state->attention_past_cursor;
+    slot = past * QWEN3_ATTENTION_KV_HEADS + kv_head;
+    pair = bpf_map_lookup_elem(&event_kv, &slot);
+    if (!pair || state->attention_seen[bounded_head] != past) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++)
+        dot += (__s64)state->query_q16[event_q_slot(base, i)] *
+               pair->key_q16[i];
+    score = ((dot >> 16) * 5793) >> 16;
+    if (score > 2147483647LL || score < -2147483648LL) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    if (!past) {
+#pragma clang loop unroll(disable)
+        for (i = 0; i < 128; i++)
+            state->attention_output_q16[event_q_slot(base, i)] =
+                pair->value_q16[i];
+        state->attention_max_score_q16[bounded_head] = (__s32)score;
+        state->attention_mass_q16[bounded_head] = 1ULL << 16;
+    } else {
+        delta = score - state->attention_max_score_q16[bounded_head];
+        mass = state->attention_mass_q16[bounded_head];
+        if (delta > 0) {
+            __u64 factor = event_exp_negative_q32((__u32)delta);
+            __u64 old_mass = mass;
+
+            mass = ((old_mass >> 16) * factor) >> 16;
+            mass += ((old_mass & 65535) * factor) >> 32;
+            weight = 1ULL << 16;
+            state->attention_max_score_q16[bounded_head] = (__s32)score;
+        } else {
+            weight = event_exp_negative_q32((__u32)-delta) >> 16;
+        }
+        new_mass = mass + weight;
+        if (!new_mass) {
+            *(__u32 *)ctx = 1;
+            return 1;
+        }
+        alpha_q24 = (weight << 24) / new_mass;
+#pragma clang loop unroll(disable)
+        for (i = 0; i < 128; i++) {
+            __u32 index = event_q_slot(base, i);
+            __s64 difference = (__s64)pair->value_q16[i] -
+                               state->attention_output_q16[index];
+            state->attention_output_q16[index] +=
+                (__s32)((difference * (__s64)alpha_q24) >> 24);
+        }
+        state->attention_mass_q16[bounded_head] = new_mass;
+    }
+    state->attention_seen[bounded_head]++;
+    state->completed_attention_heads++;
+    return 0;
+}
+
 static int event_callback(void *map, int *key, void *value)
 {
     const __u32 work_key = 0;
@@ -429,6 +572,31 @@ static int event_callback(void *map, int *key, void *value)
     if (!state || !state->rows || state->rows > QWEN3_ARENA_BF16_ROWS ||
         !state->cols || state->cols > QWEN3_ARENA_BF16_COLS) {
         job->status = QWEN3_EVENT_ERROR;
+        return 0;
+    }
+    if (state->event_attention &&
+        state->event_stage == QWEN3_EVENT_STAGE_ATTENTION) {
+        if (state->event_position >= QWEN3_EVENT_KV_LIMIT ||
+            state->attention_past_cursor > state->event_position) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->completed_attention_heads = 0;
+        bpf_loop(16, event_attention_head, &callback_ctx, 0);
+        if (callback_ctx || state->completed_attention_heads != 16) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->attention_past_cursor++;
+        if (state->attention_past_cursor <= state->event_position) {
+            if (bpf_wq_start(&job->work, 0))
+                job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->event_next_position = state->event_position + 1;
+        job->finish_ns = bpf_ktime_get_ns();
+        job->completed_requests++;
+        job->status = QWEN3_EVENT_DONE;
         return 0;
     }
     total = state->matrix_total_rows ? state->matrix_total_rows : state->rows;
@@ -542,6 +710,22 @@ static int event_callback(void *map, int *key, void *value)
                     return 0;
                 }
             }
+            if (state->event_attention) {
+                callback_ctx = 0;
+                bpf_loop(8, event_store_kv_head, &callback_ctx, 0);
+                if (callback_ctx) {
+                    job->status = QWEN3_EVENT_ERROR;
+                    return 0;
+                }
+                __builtin_memset(state->attention_seen, 0,
+                                 sizeof(state->attention_seen));
+                state->attention_past_cursor = 0;
+                state->event_stage = QWEN3_EVENT_STAGE_ATTENTION;
+                state->base_index = base;
+                if (bpf_wq_start(&job->work, 0))
+                    job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
         }
         state->base_index = base;
         job->finish_ns = bpf_ktime_get_ns();
@@ -621,6 +805,11 @@ int qwen3_event_xdp(struct xdp_md *ctx)
         if (position >= 40960)
             return XDP_PASS;
     }
+    if (state->event_attention &&
+        (!state->event_qkv || !state->event_rope ||
+         position >= QWEN3_EVENT_KV_LIMIT ||
+         (position && position != state->event_next_position)))
+        return XDP_PASS;
     job = bpf_map_lookup_elem(&event, &key);
     if (!job)
         return XDP_PASS;

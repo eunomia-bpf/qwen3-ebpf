@@ -136,6 +136,19 @@ measurements, not a full-model speed comparison. Attention, output projection,
 residual, MLP, later layers, and final token selection remain outside the
 XDP-triggered path.
 
+The first-layer attention increment stores each packet's rotated K and raw V
+in a kernel BPF map, then has the workqueue process prior positions for all
+16 query heads. On the same Linux 6.17 arm64 test container, ten packets
+repeating positions 0 and 1 matched a separate C fixed-point reference for
+all 2,048 attention outputs per packet; the independent floating-point
+two-token softmax comparison had maximum absolute error below `1.3e-4`.
+The test also checked each cached K/V element and rejected a skipped position.
+Observed packet-to-result times were about 4.1–4.2 ms for this prefix,
+including projection, normalization, RoPE, and attention; the direct matrix
+timing excludes most of that work and is not a speedup comparison. The
+event path still lacks output projection, residual/MLP, later layers,
+vocabulary argmax, and result delivery to the network client.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

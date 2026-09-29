@@ -60,6 +60,7 @@ struct qwen3_arena_bf16_work {
     __u64 k_first_bf16;
     __u64 v_first_bf16;
     __u64 o_first_bf16;
+    __u64 post_norm_first_bf16;
     __u64 q_norm_first_bf16;
     __u64 k_norm_first_bf16;
     __u64 norm_sum_sq_q32;

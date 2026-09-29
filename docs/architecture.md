@@ -42,7 +42,8 @@ weights from resident storage. The callback requeues itself across matrix
 batches and projection stages until all rows finish, without C dispatching
 each batch. An optional continuation writes K/V to a kernel map and requeues
 one attention step per prior position for all 16 query heads, then runs the
-resident output-projection matrix and adds it to the original hidden vector.
+resident output-projection matrix, adds it to the original hidden vector,
+and applies the resident post-attention RMSNorm weights.
 It accepts consecutive positions in a single-session 256-position cache; a
 position-zero packet starts a new sequence. This keeps the receive hook short,
 but the 28-layer scheduler and final-token result delivery are not yet

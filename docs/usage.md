@@ -71,11 +71,12 @@ position; the BPF work item calculates RoPE coefficients without C input.
 `make test-arena-xdp-attention MODEL=/path/to/model.safetensors` additionally
 stores first-layer K/V in a kernel map and checks attention across consecutive
 positions 0 and 1 against a fixed-point C reference and floating-point
-softmax. It also compares the output projection and residual with C. Ten
+softmax. It also compares the output projection, residual, and post-attention
+RMSNorm with C. Ten
 requests repeat the two-position sequence; non-contiguous positions are
 rejected. Do not run these XDP tests in a production network
 namespace. They are not full-model inference: the loader still supplies
-resident weights and reads results, and post-attention normalization, MLP,
+resident weights and reads results, and MLP,
 later layers, and final token selection do not run in this event path.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
@@ -149,7 +150,7 @@ network or kernel event.
 | `make test-arena-bf16` / `make test-arena-int4` | Optional arena operator checks, with `MODEL=...` for real weights. |
 | `make test-arena-xdp` | Live loopback XDP → BPF workqueue → resident BF16 operator check in the current network namespace. |
 | `make test-arena-xdp-model MODEL=...` | Ten alternating token-ID requests using resident embeddings, first-layer RMSNorm, and Q/K/V projections, checked against C. |
-| `make test-arena-xdp-attention MODEL=...` | Real packet-triggered first-layer KV-cache, attention, output projection, and residual check. |
+| `make test-arena-xdp-attention MODEL=...` | Real packet-triggered first-layer KV-cache, attention, output projection, residual, and post-attention RMSNorm check. |
 | `make clean` | Remove only generated files under `build/`. |
 
 Output names and CLI arguments are unchanged. Tests live in `tests/`, shared

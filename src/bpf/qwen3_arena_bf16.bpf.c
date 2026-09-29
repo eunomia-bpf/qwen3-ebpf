@@ -253,7 +253,9 @@ static long event_norm_sum(__u32 tile, void *ctx)
     }
 #pragma clang loop unroll(disable)
     for (i = 0; i < 128; i++) {
-        __s64 x = state->embedding_q16[bounded_tile * 128 + i];
+        __s64 x = state->event_stage == QWEN3_EVENT_STAGE_O ?
+            state->hidden_q16[bounded_tile * 128 + i] :
+            state->embedding_q16[bounded_tile * 128 + i];
         sum += (__u64)(x * x);
     }
     state->norm_sum_sq_q32 += sum;
@@ -274,7 +276,9 @@ static long event_norm_apply(__u32 tile, void *ctx)
 #pragma clang loop unroll(disable)
     for (i = 0; i < 128; i++) {
         __u32 index = bounded_tile * 128 + i;
-        __u64 first = state->norm_first_bf16 + index;
+        __u64 first = (state->event_stage == QWEN3_EVENT_STAGE_O ?
+                       state->post_norm_first_bf16 : state->norm_first_bf16) +
+                      index;
         __s64 normalized;
         __u16 bits;
 
@@ -283,7 +287,9 @@ static long event_norm_apply(__u32 tile, void *ctx)
             return 1;
         }
         bits = model_bf16[first];
-        normalized = ((__s64)state->embedding_q16[index] *
+        normalized = ((__s64)(state->event_stage == QWEN3_EVENT_STAGE_O ?
+                      state->hidden_q16[index] :
+                      state->embedding_q16[index]) *
                       (__s64)state->norm_inv_rms_q16) >> 16;
         state->input_q16[index] =
             (__s32)((normalized * q20_by_bf16[bits]) >> 20);
@@ -777,8 +783,31 @@ static int event_callback(void *map, int *key, void *value)
         }
         state->base_index = base;
         if (state->event_attention &&
-            state->event_stage == QWEN3_EVENT_STAGE_O)
+            state->event_stage == QWEN3_EVENT_STAGE_O) {
+            if (state->post_norm_first_bf16 > state->model_elements ||
+                QWEN3_ARENA_TOKEN_WIDTH >
+                    state->model_elements - state->post_norm_first_bf16) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->norm_sum_sq_q32 = 0;
+            callback_ctx = 0;
+            bpf_loop(8, event_norm_sum, &callback_ctx, 0);
+            if (callback_ctx) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->norm_inv_rms_q16 =
+                (1ULL << 32) / event_isqrt64(state->norm_sum_sq_q32 /
+                                              QWEN3_ARENA_TOKEN_WIDTH + 4295);
+            callback_ctx = 0;
+            bpf_loop(8, event_norm_apply, &callback_ctx, 0);
+            if (callback_ctx) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
             state->event_next_position = state->event_position + 1;
+        }
         job->finish_ns = bpf_ktime_get_ns();
         job->completed_requests++;
         job->status = QWEN3_EVENT_DONE;

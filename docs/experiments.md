@@ -156,9 +156,17 @@ output-projection rows, and adds those results to the original hidden vector.
 Ten alternating two-token requests matched the C Q24 projection and Q16
 residual element by element. The shared-host packet-to-result observations
 were about 6.1–6.3 ms for this longer prefix; the direct matrix-only timing
-does not cover equivalent work and provides no speedup evidence. The event
-path still lacks post-attention normalization, MLP, later layers, vocabulary
-argmax, and network result delivery.
+does not cover equivalent work and provides no speedup evidence. At that
+point the event path still lacked post-attention normalization, MLP, later
+layers, vocabulary argmax, and network result delivery.
+
+The following increment loaded the official post-attention RMSNorm weights
+into the arena. The XDP-triggered workqueue normalizes the post-projection
+residual entirely in BPF; ten two-token requests matched an independent C
+fixed-point reference element by element. This extends the first-layer prefix
+but still does not include MLP, later layers, final token selection, or
+network result delivery. The observations remain unmatched to a full-request
+user-space baseline and do not establish a speedup.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row

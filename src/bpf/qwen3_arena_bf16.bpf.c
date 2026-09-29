@@ -182,6 +182,17 @@ static long store_output_row(__u32 row, void *ctx)
     else if (state->event_stage == QWEN3_EVENT_STAGE_V &&
              index < QWEN3_ARENA_TOKEN_WIDTH)
         state->value_q16[index] = (__s32)output;
+    else if (state->event_stage == QWEN3_EVENT_STAGE_O &&
+             index < QWEN3_ARENA_TOKEN_WIDTH) {
+        __s64 residual = (__s64)state->hidden_q16[index] + output;
+
+        if (residual > 2147483647LL || residual < -2147483648LL) {
+            *(__u32 *)ctx = 1;
+            return 1;
+        }
+        state->projected_q16[index] = (__s32)output;
+        state->hidden_q16[index] = (__s32)residual;
+    }
     else {
         *(__u32 *)ctx = 1;
         return 1;
@@ -211,6 +222,7 @@ static long load_token_embedding(__u32 col, void *ctx)
     bits = model_bf16[first];
     state->embedding_q16[bounded_col] =
         q16_by_bf16[bits];
+    state->hidden_q16[bounded_col] = state->embedding_q16[bounded_col];
     return 0;
 }
 
@@ -558,6 +570,26 @@ static long event_attention_head(__u32 head, void *ctx)
     return 0;
 }
 
+static long event_attention_to_input(__u32 tile, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_tile = tile & 15;
+    int i;
+
+    if (!state || tile >= 16) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __u32 index = event_q_slot(bounded_tile * 128, i);
+
+        state->input_q16[index] = state->attention_output_q16[index];
+    }
+    return 0;
+}
+
 static int event_callback(void *map, int *key, void *value)
 {
     const __u32 work_key = 0;
@@ -593,10 +625,26 @@ static int event_callback(void *map, int *key, void *value)
                 job->status = QWEN3_EVENT_ERROR;
             return 0;
         }
-        state->event_next_position = state->event_position + 1;
-        job->finish_ns = bpf_ktime_get_ns();
-        job->completed_requests++;
-        job->status = QWEN3_EVENT_DONE;
+        if (state->o_first_bf16 > state->model_elements ||
+            2048ULL * QWEN3_ARENA_TOKEN_WIDTH >
+                state->model_elements - state->o_first_bf16) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        callback_ctx = 0;
+        bpf_loop(16, event_attention_to_input, &callback_ctx, 0);
+        if (callback_ctx) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->event_stage = QWEN3_EVENT_STAGE_O;
+        state->weight_first_bf16 = state->o_first_bf16;
+        state->matrix_total_rows = QWEN3_ARENA_TOKEN_WIDTH;
+        state->base_index = 0;
+        state->rows = QWEN3_ARENA_BF16_ROWS;
+        state->cols = 2048;
+        if (bpf_wq_start(&job->work, 0))
+            job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
     total = state->matrix_total_rows ? state->matrix_total_rows : state->rows;
@@ -606,7 +654,7 @@ static int event_callback(void *map, int *key, void *value)
         rows > total - base ||
         (state->event_qkv &&
          (state->event_stage < QWEN3_EVENT_STAGE_Q ||
-          state->event_stage > QWEN3_EVENT_STAGE_V))) {
+          state->event_stage > QWEN3_EVENT_STAGE_O))) {
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
@@ -681,7 +729,7 @@ static int event_callback(void *map, int *key, void *value)
                 job->status = QWEN3_EVENT_ERROR;
             return 0;
         }
-        if (state->event_qkv) {
+        if (state->event_qkv && state->event_stage == QWEN3_EVENT_STAGE_V) {
             if (state->q_norm_first_bf16 > state->model_elements ||
                 128 > state->model_elements - state->q_norm_first_bf16 ||
                 state->k_norm_first_bf16 > state->model_elements ||
@@ -728,6 +776,9 @@ static int event_callback(void *map, int *key, void *value)
             }
         }
         state->base_index = base;
+        if (state->event_attention &&
+            state->event_stage == QWEN3_EVENT_STAGE_O)
+            state->event_next_position = state->event_position + 1;
         job->finish_ns = bpf_ktime_get_ns();
         job->completed_requests++;
         job->status = QWEN3_EVENT_DONE;
@@ -828,6 +879,7 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     state->event_position = position;
     if (state->event_qkv) {
         state->event_stage = QWEN3_EVENT_STAGE_Q;
+        state->cols = QWEN3_ARENA_TOKEN_WIDTH;
         state->weight_first_bf16 = state->q_first_bf16;
         state->matrix_total_rows = 2048;
     }

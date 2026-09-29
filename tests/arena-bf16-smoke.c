@@ -166,7 +166,9 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                          const uint32_t *token_ids,
                          const int32_t *expected_cosine,
                          const int32_t *expected_sine,
-                         const int32_t *expected_attention)
+                         const int32_t *expected_attention,
+                         const int32_t *expected_projected,
+                         const int32_t *expected_hidden)
 {
     const __u32 key = 0;
     unsigned char payload[12] = {'Q', '3', 'B', 'P'};
@@ -328,7 +330,7 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
             job.completed_requests != attempt + 1 ||
             job.finish_ns < job.start_ns ||
             (work->event_qkv && work->event_stage !=
-             (work->event_attention ? QWEN3_EVENT_STAGE_ATTENTION :
+             (work->event_attention ? QWEN3_EVENT_STAGE_O :
                                       QWEN3_EVENT_STAGE_V)) ||
             (work->event_qkv && work->completed_qk_heads != 24) ||
             (work->event_rope &&
@@ -419,6 +421,16 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                     goto done;
                 }
             }
+            for (i = 0; i < QWEN3_ARENA_TOKEN_WIDTH; i++) {
+                if (work->projected_q16[i] !=
+                        expected_projected[scenario * QWEN3_ARENA_TOKEN_WIDTH + i] ||
+                    work->hidden_q16[i] !=
+                        expected_hidden[scenario * QWEN3_ARENA_TOKEN_WIDTH + i]) {
+                    fprintf(stderr, "XDP attention residual position %u row %u mismatch\n",
+                            position, i);
+                    goto done;
+                }
+            }
             for (i = 0; i < 16; i++)
                 if (work->attention_seen[i] != position + 1) {
                     fprintf(stderr, "XDP attention head %u saw %u positions\n",
@@ -428,8 +440,11 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
         }
         if (work->event_use_token) {
             for (i = 0; i < QWEN3_ARENA_TOKEN_WIDTH; i++) {
-                if (work->input_q16[i] !=
-                    expected_inputs[(attempt % 2) * QWEN3_ARENA_TOKEN_WIDTH + i]) {
+                int32_t wanted_input = work->event_attention ?
+                    expected_attention[scenario * 2048 + i] :
+                    expected_inputs[(attempt % 2) * QWEN3_ARENA_TOKEN_WIDTH + i];
+
+                if (work->input_q16[i] != wanted_input) {
                     fprintf(stderr, "XDP normalized input mismatch at %u\n", i);
                     goto done;
                 }
@@ -439,13 +454,22 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                     goto done;
                 }
             }
+            if (work->event_attention)
+                for (i = 1024; i < 2048; i++)
+                    if (work->input_q16[i] !=
+                        expected_attention[scenario * 2048 + i]) {
+                        fprintf(stderr, "XDP attention matrix input mismatch at %u\n", i);
+                        goto done;
+                    }
         }
         if (clock_gettime(CLOCK_MONOTONIC, &now))
             goto done;
         elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
                      now.tv_nsec - begin.tv_nsec;
         printf("XDP request %u -> %u resident projection rows: host %.3f ms, kernel %.3f ms\n",
-               attempt + 1, expected_stride, (double)elapsed_ns / 1000000.0,
+               attempt + 1,
+               expected_stride + (work->event_attention ? 1024u : 0u),
+               (double)elapsed_ns / 1000000.0,
                (double)(job.finish_ns - job.start_ns) / 1000000.0);
         if (work->event_attention && attempt == 0) {
             payload[8] = payload[9] = payload[10] = 0;
@@ -530,11 +554,14 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     uint64_t projection_byte[3], projection_elements[3], projection_first[3];
     uint64_t embedding_byte, embedding_elements, cursor;
     uint64_t norm_byte, norm_elements, norm_first;
+    uint64_t o_byte, o_elements, o_first;
     uint64_t head_norm_byte[2], head_norm_first[2], head_norm_elements[2];
     int32_t q24[1024], hidden[2][1024], normalized[2][1024];
     int32_t norm_q20[1024], head_norm_q20[2][128];
     int32_t expected[2][4096], norm_expected[2][4096];
     int32_t event_expected[4][4096], attention_expected[2][2048];
+    int32_t projected_expected[2][1024], residual_expected[2][1024];
+    int32_t o_q24[2048];
     int32_t rope_cosine[4][64], rope_sine[4][64];
     int32_t direct_outputs[4096];
     float embedding[1024], norm_weights[1024], head_norm_weights[2][128];
@@ -578,6 +605,11 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             safetensors_read_bf16_at(&file, head_norm_byte[set], 0, 128,
                                      head_norm_weights[set]))
             goto done;
+    if (with_attention &&
+        (safetensors_find_bf16(&file,
+            "model.layers.0.self_attn.o_proj.weight", &o_byte,
+            &o_elements) || o_elements != 1024ULL * 2048))
+        goto done;
     embedding_raw = file.mapping + 8 + file.header_length + embedding_byte;
     norm_raw = file.mapping + 8 + file.header_length + norm_byte;
     memset(work, 0, sizeof(*work));
@@ -585,6 +617,8 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     for (projection = 0; projection < 3; projection++)
         work->model_elements += projection_elements[projection];
     work->model_elements += head_norm_elements[0] + head_norm_elements[1];
+    if (with_attention)
+        work->model_elements += o_elements;
     if (bpf_prog_test_run_opts(
             bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
             &opts) || opts.retval || !skel->bss->model_bf16) {
@@ -613,6 +647,14 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
         memcpy(skel->bss->model_bf16 + cursor, raw,
                head_norm_elements[set] * 2);
         cursor += head_norm_elements[set];
+    }
+    if (with_attention) {
+        const uint8_t *raw = file.mapping + 8 + file.header_length + o_byte;
+
+        o_first = cursor;
+        memcpy(skel->bss->model_bf16 + cursor, raw, o_elements * 2);
+        cursor += o_elements;
+        work->o_first_bf16 = o_first;
     }
     work->cols = 1024;
     work->rows = QWEN3_ARENA_BF16_ROWS;
@@ -739,6 +781,24 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     if (with_attention &&
         reference_two_token_attention(event_expected, attention_expected))
         goto done;
+    if (with_attention)
+        for (token = 0; token < 2; token++)
+            for (row = 0; row < 1024; row++) {
+                int64_t sum = 0, residual;
+
+                if (safetensors_read_bf16_q24_at(&file, o_byte,
+                        (uint64_t)row * 2048, 2048, o_q24))
+                    goto done;
+                for (col = 0; col < 2048; col++)
+                    sum += (int64_t)attention_expected[token][col] * o_q24[col];
+                sum >>= 24;
+                residual = (int64_t)hidden[token][row] + sum;
+                if (sum > INT32_MAX || sum < INT32_MIN ||
+                    residual > INT32_MAX || residual < INT32_MIN)
+                    goto done;
+                projected_expected[token][row] = (int32_t)sum;
+                residual_expected[token][row] = (int32_t)residual;
+            }
     for (int attempt = 0; attempt < 10; attempt++) {
         struct timespec begin, end;
         __s64 elapsed_ns;
@@ -778,7 +838,9 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     rc = run_xdp_event(skel, work, &event_expected[0][0], 2048,
                        &normalized[0][0], &hidden[0][0], token_ids,
                        &rope_cosine[0][0], &rope_sine[0][0],
-                       with_attention ? &attention_expected[0][0] : NULL);
+                       with_attention ? &attention_expected[0][0] : NULL,
+                       with_attention ? &projected_expected[0][0] : NULL,
+                       with_attention ? &residual_expected[0][0] : NULL);
 done:
     safetensors_close(&file);
     return rc;
@@ -880,7 +942,7 @@ int main(int argc, char **argv)
         if (argc == 1 ||
             (strcmp(argv[1], "--xdp-loopback") == 0 ?
              !run_xdp_event(skel, work, expected, 2, NULL, NULL, NULL,
-                            NULL, NULL, NULL) :
+                            NULL, NULL, NULL, NULL, NULL) :
              !run_model_rows(skel, work, argv[1]))) {
             puts("arena BF16 smoke passed");
             rc = 0;

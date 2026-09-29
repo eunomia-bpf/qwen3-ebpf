@@ -149,6 +149,17 @@ timing excludes most of that work and is not a speedup comparison. The
 event path still lacks output projection, residual/MLP, later layers,
 vocabulary argmax, and result delivery to the network client.
 
+The next increment loaded the official first-layer output-projection weights
+into the same BPF arena. After the attention work item finishes, the kernel
+copies its 2,048 outputs into the resident matrix input, schedules all 1,024
+output-projection rows, and adds those results to the original hidden vector.
+Ten alternating two-token requests matched the C Q24 projection and Q16
+residual element by element. The shared-host packet-to-result observations
+were about 6.1–6.3 ms for this longer prefix; the direct matrix-only timing
+does not cover equivalent work and provides no speedup evidence. The event
+path still lacks post-attention normalization, MLP, later layers, vocabulary
+argmax, and network result delivery.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

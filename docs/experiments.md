@@ -168,6 +168,15 @@ but still does not include MLP, later layers, final token selection, or
 network result delivery. The observations remain unmatched to a full-request
 user-space baseline and do not establish a speedup.
 
+The next step kept the normalized residual in the work map and scheduled the
+official first-layer MLP gate and up projections, 3,072 rows each, entirely
+from the BPF workqueue. Ten two-token packets matched independent C Q24
+matrix calculations for every row. Packet-to-result observations varied from
+about 12 to 26 ms on the shared test host; these include the longer prefix and
+are not a matched full-request comparison. SiLU, the gate/up product, down
+projection, later layers, argmax, and network result delivery remain outside
+the event path.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

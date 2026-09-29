@@ -20,6 +20,8 @@
 #define QWEN3_EVENT_STAGE_V 3u
 #define QWEN3_EVENT_STAGE_ATTENTION 4u
 #define QWEN3_EVENT_STAGE_O 5u
+#define QWEN3_EVENT_STAGE_GATE 6u
+#define QWEN3_EVENT_STAGE_UP 7u
 
 struct qwen3_event_state {
     struct bpf_wq work;
@@ -61,6 +63,8 @@ struct qwen3_arena_bf16_work {
     __u64 v_first_bf16;
     __u64 o_first_bf16;
     __u64 post_norm_first_bf16;
+    __u64 gate_first_bf16;
+    __u64 up_first_bf16;
     __u64 q_norm_first_bf16;
     __u64 k_norm_first_bf16;
     __u64 norm_sum_sq_q32;
@@ -81,6 +85,8 @@ struct qwen3_arena_bf16_work {
     __s32 value_q16[QWEN3_ARENA_TOKEN_WIDTH];
     __s32 attention_output_q16[2048];
     __s32 projected_q16[QWEN3_ARENA_TOKEN_WIDTH];
+    __s32 gate_q16[QWEN3_ARENA_EVENT_OUTPUTS];
+    __s32 up_q16[QWEN3_ARENA_EVENT_OUTPUTS];
 };
 
 #endif

@@ -193,6 +193,10 @@ static long store_output_row(__u32 row, void *ctx)
         state->projected_q16[index] = (__s32)output;
         state->hidden_q16[index] = (__s32)residual;
     }
+    else if (state->event_stage == QWEN3_EVENT_STAGE_GATE)
+        state->gate_q16[index] = (__s32)output;
+    else if (state->event_stage == QWEN3_EVENT_STAGE_UP)
+        state->up_q16[index] = (__s32)output;
     else {
         *(__u32 *)ctx = 1;
         return 1;
@@ -660,7 +664,7 @@ static int event_callback(void *map, int *key, void *value)
         rows > total - base ||
         (state->event_qkv &&
          (state->event_stage < QWEN3_EVENT_STAGE_Q ||
-          state->event_stage > QWEN3_EVENT_STAGE_O))) {
+          state->event_stage > QWEN3_EVENT_STAGE_UP))) {
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
@@ -806,8 +810,41 @@ static int event_callback(void *map, int *key, void *value)
                 job->status = QWEN3_EVENT_ERROR;
                 return 0;
             }
-            state->event_next_position = state->event_position + 1;
+            if (state->gate_first_bf16 > state->model_elements ||
+                (__u64)QWEN3_ARENA_EVENT_OUTPUTS * QWEN3_ARENA_TOKEN_WIDTH >
+                    state->model_elements - state->gate_first_bf16) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->event_stage = QWEN3_EVENT_STAGE_GATE;
+            state->weight_first_bf16 = state->gate_first_bf16;
+            state->matrix_total_rows = QWEN3_ARENA_EVENT_OUTPUTS;
+            state->base_index = 0;
+            state->rows = QWEN3_ARENA_BF16_ROWS;
+            state->cols = QWEN3_ARENA_TOKEN_WIDTH;
+            if (bpf_wq_start(&job->work, 0))
+                job->status = QWEN3_EVENT_ERROR;
+            return 0;
         }
+        if (state->event_attention &&
+            state->event_stage == QWEN3_EVENT_STAGE_GATE) {
+            if (state->up_first_bf16 > state->model_elements ||
+                (__u64)QWEN3_ARENA_EVENT_OUTPUTS * QWEN3_ARENA_TOKEN_WIDTH >
+                    state->model_elements - state->up_first_bf16) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->event_stage = QWEN3_EVENT_STAGE_UP;
+            state->weight_first_bf16 = state->up_first_bf16;
+            state->base_index = 0;
+            state->rows = QWEN3_ARENA_BF16_ROWS;
+            if (bpf_wq_start(&job->work, 0))
+                job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        if (state->event_attention &&
+            state->event_stage == QWEN3_EVENT_STAGE_UP)
+            state->event_next_position = state->event_position + 1;
         job->finish_ns = bpf_ktime_get_ns();
         job->completed_requests++;
         job->status = QWEN3_EVENT_DONE;

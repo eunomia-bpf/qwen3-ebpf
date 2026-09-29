@@ -34,8 +34,9 @@ runs them via `BPF_PROG_RUN`; it does not attach the full-model schedule to a
 socket or XDP interface. The optional arena object now has a separate XDP
 entrypoint: a matching UDP packet queues a BPF work item that advances through
 all batches of the first-layer Q/K/V resident-weight matrices. The test reads
-their results from a BPF map. In the real-weight test, the packet supplies a
-token ID. The work item first reads its embedding and first-layer RMSNorm
+their results from a BPF map. After projection, the work item also normalizes
+each Q/K head using resident BF16 weights. In the real-weight test, the packet
+supplies a token ID. The work item first reads its embedding and first-layer RMSNorm
 weights from resident storage. The callback requeues itself across matrix
 batches and projection stages until all rows finish, without C dispatching
 each batch. This keeps the receive hook short, but the 28-layer scheduler and

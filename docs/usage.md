@@ -63,8 +63,9 @@ exit. `make test-arena-xdp-model MODEL=/path/to/model.safetensors` instead
 uses the official layer-0 Q/K/V projection matrices: the kernel workqueue
 advances through all 4,096 rows in 128-row batches after each packet. Packets
 alternate two token IDs; the workqueue reads their embeddings from resident
-weights and performs first-layer input RMSNorm before the projections. The test
-compares embedding, normalized vector, and all Q/K/V rows with C references.
+weights and performs first-layer input RMSNorm before the projections, then
+head-wise RMSNorm on Q/K. The test compares embedding, normalized vector, raw
+Q/K/V projection rows, and normalized Q/K heads with C references.
 Do not run either XDP test in a production network namespace. They are not
 full-model inference: the loader still supplies resident weights and reads
 results, and no subsequent decoder operators or layers run in this event path.

@@ -115,6 +115,16 @@ embedding and normalization, so these are not matched full-request timings
 and do not establish a speedup. Q/K norm, RoPE, attention, MLP, later layers,
 and final-token delivery remain outside this event path.
 
+The next increment added head-wise Q/K RMSNorm after the same 4,096 Q/K/V
+projection rows. The XDP work item reads the official first-layer Q/K norm
+weights from the BF16 arena and normalizes all 16 query and 8 key heads in
+kernel space; V remains the raw projection. Ten alternating real-token
+requests matched separate C fixed-point references for both the unnormalized
+projection rows and all normalized Q/K outputs. The previously reported direct
+matrix timing excludes this additional work and is not a matched comparison.
+RoPE, attention, output projection, residual, MLP, later layers, and final
+token selection are still absent from the event path.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

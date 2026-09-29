@@ -251,6 +251,54 @@ static long event_norm_apply(__u32 tile, void *ctx)
     return 0;
 }
 
+static long event_qk_norm_head(__u32 head, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_head = head & 31;
+    __u32 is_key, base;
+    __u64 sum = 0, inv_rms;
+    int i;
+
+    if (!state || !model_bf16 || bounded_head >= 24) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+    is_key = bounded_head >= 16;
+    base = (bounded_head & 15) * 128;
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __s64 x = is_key ? state->key_q16[base + i] :
+                             state->query_q16[base + i];
+        sum += (__u64)(x * x);
+    }
+    inv_rms = (1ULL << 32) / event_isqrt64(sum / 128 + 4295);
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __u64 first = (is_key ? state->k_norm_first_bf16 :
+                               state->q_norm_first_bf16) + i;
+        __u16 bits;
+        __s64 x, normalized;
+
+        if (first >= state->model_elements) {
+            *(__u32 *)ctx = 1;
+            return 1;
+        }
+        bits = model_bf16[first];
+        x = is_key ? state->key_q16[base + i] :
+                     state->query_q16[base + i];
+        normalized = (x * (__s64)inv_rms) >> 16;
+        if (is_key)
+            state->key_q16[base + i] =
+                (__s32)((normalized * q20_by_bf16[bits]) >> 20);
+        else
+            state->query_q16[base + i] =
+                (__s32)((normalized * q20_by_bf16[bits]) >> 20);
+    }
+    state->completed_qk_heads++;
+    return 0;
+}
+
 static int event_callback(void *map, int *key, void *value)
 {
     const __u32 work_key = 0;
@@ -348,6 +396,22 @@ static int event_callback(void *map, int *key, void *value)
             if (bpf_wq_start(&job->work, 0))
                 job->status = QWEN3_EVENT_ERROR;
             return 0;
+        }
+        if (state->event_qkv) {
+            if (state->q_norm_first_bf16 > state->model_elements ||
+                128 > state->model_elements - state->q_norm_first_bf16 ||
+                state->k_norm_first_bf16 > state->model_elements ||
+                128 > state->model_elements - state->k_norm_first_bf16) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
+            state->completed_qk_heads = 0;
+            callback_ctx = 0;
+            bpf_loop(24, event_qk_norm_head, &callback_ctx, 0);
+            if (callback_ctx || state->completed_qk_heads != 24) {
+                job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
         }
         state->base_index = base;
         job->finish_ns = bpf_ktime_get_ns();

@@ -263,6 +263,7 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
             job.completed_requests != attempt + 1 ||
             job.finish_ns < job.start_ns ||
             (work->event_qkv && work->event_stage != QWEN3_EVENT_STAGE_V) ||
+            (work->event_qkv && work->completed_qk_heads != 24) ||
             work->base_index != (work->event_qkv ?
                 QWEN3_ARENA_TOKEN_WIDTH : total) ||
             work->completed != ((total - 1) % QWEN3_ARENA_BF16_ROWS + 1)) {
@@ -322,17 +323,23 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
     uint64_t projection_byte[3], projection_elements[3], projection_first[3];
     uint64_t embedding_byte, embedding_elements, cursor;
-    uint64_t norm_byte, norm_elements;
+    uint64_t norm_byte, norm_elements, norm_first;
+    uint64_t head_norm_byte[2], head_norm_first[2], head_norm_elements[2];
     int32_t q24[1024], hidden[2][1024], normalized[2][1024];
-    int32_t norm_q20[1024], expected[2][4096];
+    int32_t norm_q20[1024], head_norm_q20[2][128];
+    int32_t expected[2][4096], event_expected[2][4096];
     int32_t direct_outputs[4096];
-    float embedding[1024], norm_weights[1024];
+    float embedding[1024], norm_weights[1024], head_norm_weights[2][128];
     const uint8_t *embedding_raw, *norm_raw;
     const uint32_t token_ids[2] = {0, 151935};
     const char *projection_names[3] = {
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.self_attn.k_proj.weight",
         "model.layers.0.self_attn.v_proj.weight",
+    };
+    const char *head_norm_names[2] = {
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.k_norm.weight",
     };
     const int projection_rows[3] = {2048, 1024, 1024};
     const int output_offsets[3] = {0, 2048, 3072};
@@ -356,12 +363,20 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             projection_elements[projection] !=
                 (uint64_t)projection_rows[projection] * QWEN3_ARENA_TOKEN_WIDTH)
             goto done;
+    for (int set = 0; set < 2; set++)
+        if (safetensors_find_bf16(&file, head_norm_names[set],
+                &head_norm_byte[set], &head_norm_elements[set]) ||
+            head_norm_elements[set] != 128 ||
+            safetensors_read_bf16_at(&file, head_norm_byte[set], 0, 128,
+                                     head_norm_weights[set]))
+            goto done;
     embedding_raw = file.mapping + 8 + file.header_length + embedding_byte;
     norm_raw = file.mapping + 8 + file.header_length + norm_byte;
     memset(work, 0, sizeof(*work));
     work->model_elements = embedding_elements + norm_elements;
     for (projection = 0; projection < 3; projection++)
         work->model_elements += projection_elements[projection];
+    work->model_elements += head_norm_elements[0] + head_norm_elements[1];
     if (bpf_prog_test_run_opts(
             bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
             &opts) || opts.retval || !skel->bss->model_bf16) {
@@ -379,7 +394,18 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                projection_elements[projection] * 2);
         cursor += projection_elements[projection];
     }
+    norm_first = cursor;
     memcpy(skel->bss->model_bf16 + cursor, norm_raw, norm_elements * 2);
+    cursor += norm_elements;
+    for (int set = 0; set < 2; set++) {
+        const uint8_t *raw = file.mapping + 8 + file.header_length +
+                             head_norm_byte[set];
+
+        head_norm_first[set] = cursor;
+        memcpy(skel->bss->model_bf16 + cursor, raw,
+               head_norm_elements[set] * 2);
+        cursor += head_norm_elements[set];
+    }
     work->cols = 1024;
     work->rows = QWEN3_ARENA_BF16_ROWS;
     work->resident_weights = 1;
@@ -387,7 +413,9 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     work->q_first_bf16 = projection_first[0];
     work->k_first_bf16 = projection_first[1];
     work->v_first_bf16 = projection_first[2];
-    work->norm_first_bf16 = cursor;
+    work->norm_first_bf16 = norm_first;
+    work->q_norm_first_bf16 = head_norm_first[0];
+    work->k_norm_first_bf16 = head_norm_first[1];
     work->embedding_vocab = 151936;
     work->event_use_token = 1;
     work->event_qkv = 1;
@@ -398,6 +426,15 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             goto done;
         norm_q20[col] = (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
     }
+    for (int set = 0; set < 2; set++)
+        for (col = 0; col < 128; col++) {
+            double scaled = (double)head_norm_weights[set][col] * 1048576.0;
+
+            if (!isfinite(scaled) || scaled > INT32_MAX || scaled < INT32_MIN)
+                goto done;
+            head_norm_q20[set][col] =
+                (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+        }
     for (token = 0; token < 2; token++) {
         uint64_t sum_sq_q32 = 0, inv_rms_q16;
 
@@ -441,6 +478,25 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                     (int32_t)sum;
             }
         }
+        memcpy(event_expected[token], expected[token], sizeof(expected[token]));
+        for (int head = 0; head < 24; head++) {
+            int set = head >= 16;
+            int base = set ? 2048 + (head - 16) * 128 : head * 128;
+            uint64_t sum_sq_q32 = 0, inv_rms_q16;
+
+            for (int i = 0; i < 128; i++) {
+                int64_t x = expected[token][base + i];
+                sum_sq_q32 += (uint64_t)(x * x);
+            }
+            inv_rms_q16 = (1ULL << 32) /
+                reference_isqrt64(sum_sq_q32 / 128 + 4295);
+            for (int i = 0; i < 128; i++) {
+                int64_t scaled = ((int64_t)expected[token][base + i] *
+                                  (int64_t)inv_rms_q16) >> 16;
+                event_expected[token][base + i] =
+                    (int32_t)((scaled * head_norm_q20[set][i]) >> 20);
+            }
+        }
     }
     for (int attempt = 0; attempt < 10; attempt++) {
         struct timespec begin, end;
@@ -478,7 +534,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
         printf("BPF_PROG_RUN request %d -> 4096 QKV rows: %.3f ms\n",
                attempt + 1, (double)elapsed_ns / 1000000.0);
     }
-    rc = run_xdp_event(skel, work, &expected[0][0], 2048,
+    rc = run_xdp_event(skel, work, &event_expected[0][0], 2048,
                        &normalized[0][0], &hidden[0][0], token_ids);
 done:
     safetensors_close(&file);

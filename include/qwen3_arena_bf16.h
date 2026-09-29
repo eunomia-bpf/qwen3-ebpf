@@ -1,11 +1,23 @@
 #ifndef QWEN3_ARENA_BF16_H
 #define QWEN3_ARENA_BF16_H
 
+#include <linux/bpf.h>
 #include <linux/types.h>
 
 #define QWEN3_ARENA_BF16_ROWS 128
 #define QWEN3_ARENA_BF16_COLS 3072
 #define QWEN3_ARENA_MODEL_MAX_BF16 (768u * 1024u * 1024u)
+
+#define QWEN3_EVENT_READY 1u
+#define QWEN3_EVENT_RUNNING 2u
+#define QWEN3_EVENT_DONE 3u
+#define QWEN3_EVENT_ERROR 4u
+
+struct qwen3_event_state {
+    struct bpf_wq work;
+    __u64 status;
+    __u32 requests;
+};
 
 struct qwen3_arena_bf16_work {
     __s32 input_q16[QWEN3_ARENA_BF16_COLS];

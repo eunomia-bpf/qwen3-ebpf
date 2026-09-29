@@ -53,8 +53,15 @@ kernel memory for the official model, in addition to its file mapping and KV
 cache. C still selects operators, supplies embeddings and other small weights,
 and reads results, so this is not yet a user-space-free inference service.
 
-The test loads an ephemeral BPF program and map; it attaches to no network
-interface and installs nothing persistently.
+The ordinary arena test loads an ephemeral BPF program and map; it attaches
+to no network interface. To exercise the separate packet-triggered operator
+on a disposable test network namespace, run `make test-arena-xdp`. That test
+temporarily attaches XDP to the namespace's loopback interface, sends one
+UDP request, waits for the BPF workqueue to calculate two resident BF16 rows,
+checks both outputs against C, and detaches the BPF link before exit. Do not
+run the XDP test in a production network namespace. It is not full-model
+inference: the test loader still supplies the input vector and resident
+weights, and reads the result.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:
@@ -125,6 +132,7 @@ network or kernel event.
 | `make experiments` | Build standalone matvec, INT4, INT8 operators and their test drivers. |
 | `make build/infer-arena-bf16` | Build the optional full-model arena path and its operator dependencies. |
 | `make test-arena-bf16` / `make test-arena-int4` | Optional arena operator checks, with `MODEL=...` for real weights. |
+| `make test-arena-xdp` | Live loopback XDP → BPF workqueue → resident BF16 operator check in the current network namespace. |
 | `make clean` | Remove only generated files under `build/`. |
 
 Output names and CLI arguments are unchanged. Tests live in `tests/`, shared

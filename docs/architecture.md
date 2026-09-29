@@ -29,15 +29,14 @@ arena path loads the complete model payload into kernel-owned arena pages and
 does matrix conversion in BPF. C still controls the layer sequence and reads
 non-matrix weights from the model file.
 
-The operators use the `socket` BPF program type, but the driver runs them via
-`BPF_PROG_RUN`; it does not attach them to a socket or an XDP interface. An
-attached network hook could recognize a request, but making inference
-kernel-owned also requires a kernel-side scheduler for the bounded operator
-invocations and a way to report completion. Merely
-changing the hook type does not provide those pieces. Running seconds of
-inference inline on the packet receive path would also make packet latency
-depend on model execution, so a live hook should not be treated as a full
-inference backend until those properties are demonstrated.
+The full-model driver's operators use the `socket` BPF program type, but it
+runs them via `BPF_PROG_RUN`; it does not attach the full-model schedule to a
+socket or XDP interface. The optional arena object now has a separate XDP
+entrypoint: a matching UDP packet queues a BPF work item that executes one
+resident-weight matrix operation, and the test reads its result from a BPF
+map. This keeps the receive hook short, but the 28-layer scheduler and result
+delivery are not yet kernel-owned. Merely changing the hook type does not
+provide those pieces, and full inference must not run inline in XDP.
 
 | Kernel program | Role in full inference |
 | --- | --- |

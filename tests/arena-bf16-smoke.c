@@ -1,9 +1,13 @@
 #include <limits.h>
 #include <math.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -118,6 +122,92 @@ static int run_resident_synthetic(struct qwen3_arena_bf16_bpf *skel,
     return 0;
 }
 
+static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
+                         struct qwen3_arena_bf16_work *work)
+{
+    const __u32 key = 0;
+    const char payload[] = "Q3BP";
+    struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
+    struct qwen3_event_state job;
+    struct bpf_link *link = NULL;
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons(49002),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    struct timespec begin, now;
+    __s64 expected[2], elapsed_ns;
+    unsigned int ifindex = if_nametoindex("lo");
+    int fd = -1, rc = -1;
+
+    if (!ifindex) {
+        perror("loopback ifindex");
+        return -1;
+    }
+    expected[0] = work->output_q16[0];
+    expected[1] = work->output_q16[1];
+    work->output_q16[0] = INT64_MIN;
+    work->output_q16[1] = INT64_MIN;
+    work->completed = 0;
+    if (bpf_prog_test_run_opts(bpf_program__fd(skel->progs.qwen3_event_init),
+                               &opts) || opts.retval) {
+        fprintf(stderr, "BPF workqueue initialization failed\n");
+        return -1;
+    }
+    link = bpf_program__attach_xdp(skel->progs.qwen3_event_xdp, ifindex);
+    if (!link || libbpf_get_error(link)) {
+        fprintf(stderr, "XDP attach to container loopback failed: %ld\n",
+                link ? libbpf_get_error(link) : -1L);
+        link = NULL;
+        goto done;
+    }
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0 || clock_gettime(CLOCK_MONOTONIC, &begin)) {
+        perror("XDP event socket/clock");
+        goto done;
+    }
+    if (sendto(fd, payload, sizeof(payload) - 1, 0,
+               (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload) - 1) {
+        perror("XDP event sendto");
+        goto done;
+    }
+    do {
+        if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job)) {
+            perror("XDP event lookup");
+            goto done;
+        }
+        if (job.status == QWEN3_EVENT_ERROR) {
+            fprintf(stderr, "XDP event callback/start failed\n");
+            goto done;
+        }
+        if (job.status == QWEN3_EVENT_DONE)
+            break;
+        usleep(1000);
+        if (clock_gettime(CLOCK_MONOTONIC, &now))
+            goto done;
+        elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
+                     now.tv_nsec - begin.tv_nsec;
+    } while (elapsed_ns < 5000000000LL);
+    if (job.status != QWEN3_EVENT_DONE || job.requests != 1 ||
+        work->completed != 2 || work->output_q16[0] != expected[0] ||
+        work->output_q16[1] != expected[1]) {
+        fprintf(stderr, "XDP event result mismatch: status=%llu requests=%u completed=%u\n",
+                (unsigned long long)job.status, job.requests, work->completed);
+        goto done;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
+                 now.tv_nsec - begin.tv_nsec;
+    printf("XDP live packet -> BPF workqueue -> resident matvec: %.3f ms\n",
+           (double)elapsed_ns / 1000000.0);
+    rc = 0;
+done:
+    if (fd >= 0)
+        close(fd);
+    bpf_link__destroy(link);
+    return rc;
+}
+
 static int run_model_rows(struct qwen3_arena_bf16_bpf *skel,
                           struct qwen3_arena_bf16_work *work,
                           const char *path)
@@ -197,7 +287,9 @@ int main(int argc, char **argv)
     populate_lut(skel);
     if (!run_synthetic(skel, work) &&
         !run_resident_synthetic(skel, work) &&
-        (argc == 1 || !run_model_rows(skel, work, argv[1]))) {
+        (argc == 1 ||
+         (strcmp(argv[1], "--xdp-loopback") == 0 ?
+          !run_xdp_event(skel, work) : !run_model_rows(skel, work, argv[1])))) {
         puts("arena BF16 smoke passed");
         rc = 0;
     }

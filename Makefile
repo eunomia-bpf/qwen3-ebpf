@@ -23,7 +23,7 @@ ARENA_INCLUDES := $(INCLUDES) -Ibuild -I$(ARENA_LIBBPF_INCLUDE) -I$(ARENA_UAPI_I
 ARENA_STEMS := build/qwen3_arena_int4 build/qwen3_arena_bf16
 
 .DEFAULT_GOAL := all
-.PHONY: all help experiments test test-model test-tokenizer test-arena-int4 test-arena-bf16 clean
+.PHONY: all help experiments test test-model test-tokenizer test-arena-int4 test-arena-bf16 test-arena-xdp clean
 
 # The default build is the working inference path, not the experiment suite.
 all: build/infer $(BPF_OBJECTS)
@@ -36,6 +36,7 @@ help:
 	  'make experiments     Build standalone matvec / INT4 / INT8 experiments' \
 	  'make build/infer-arena-bf16      Build optional arena inference' \
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
+	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
 	  'make test-arena-int4 [MODEL=...] Run optional arena INT4 checks' \
 	  'make clean           Remove build outputs'
 
@@ -105,6 +106,9 @@ test-arena-int4: build/arena-int4-smoke
 
 test-arena-bf16: build/arena-bf16-smoke
 	./build/arena-bf16-smoke $(if $(MODEL),"$(MODEL)")
+
+test-arena-xdp: build/arena-bf16-smoke
+	./build/arena-bf16-smoke --xdp-loopback
 
 clean:
 	$(RM) -r build

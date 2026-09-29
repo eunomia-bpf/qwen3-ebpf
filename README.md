@@ -114,9 +114,11 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   drop-in inference replacements.
 - The KV cache costs about 224 KiB per requested position. The model's 40,960
   position limit is not a validated context capacity for this implementation.
-- The optional BF16 arena keeps model weights in kernel memory, but C still
-  schedules every operator and handles text; no live network hook or
-  end-to-end speedup has been established.
+- The optional BF16 arena keeps model weights in kernel memory. A separate
+  XDP-to-BPF-workqueue smoke test proves a live packet can trigger one resident
+  matrix operation, but C still schedules every operator in full inference
+  and handles text. No full-model event path or end-to-end speedup has been
+  established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

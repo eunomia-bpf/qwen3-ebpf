@@ -61,8 +61,13 @@ Single-run wall-clock measurements, including model loading, were 1.412 s
 were 1.213 s and 1.089 s. These are exploratory runs under a shared-host
 load, not evidence of an end-to-end speedup: the resident path pays for arena
 allocation and copying up front, while C still dispatches every operator.
-It is not attached to a live socket or XDP hook, and the 28-layer schedule
-remains in user space.
+The full-model driver is not attached to a live socket or XDP hook, and the
+28-layer schedule remains in user space. A separate live-loopback test on the
+same kernel sent one UDP packet through XDP, queued a BPF work item, and
+checked a two-row, 128-column resident BF16 matvec against independent C
+results. Two packet-to-result observations were 0.120 and 1.180 ms; these
+are only operator-path measurements, not full-model latency or speedup
+claim. The test loader supplied the input and read the map result.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row

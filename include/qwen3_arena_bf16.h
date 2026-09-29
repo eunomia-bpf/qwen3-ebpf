@@ -42,6 +42,10 @@ struct qwen3_arena_bf16_work {
     __u32 event_token_id;
     __u32 embedding_vocab;
     __u64 embedding_first_bf16;
+    __u64 norm_first_bf16;
+    __u64 norm_sum_sq_q32;
+    __u64 norm_inv_rms_q16;
+    __s32 embedding_q16[QWEN3_ARENA_TOKEN_WIDTH];
     __s32 matrix_output_q16[QWEN3_ARENA_EVENT_OUTPUTS];
 };
 

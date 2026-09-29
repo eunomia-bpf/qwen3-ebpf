@@ -90,8 +90,19 @@ exact Q16 embedding and
 did not start work. One shared-host run gave median 2.085 ms for the
 user-dispatched matrix batches and 2.158 ms for packet-to-result observation
 (2.092 ms by BPF timestamps). These are small, non-isolated samples with
-different timing boundaries, not evidence of a reliable speedup. This test
-does not apply RMSNorm or execute the remaining decoder layers.
+different timing boundaries, not evidence of a reliable speedup. That
+revision did not apply RMSNorm or execute the remaining decoder layers.
+
+The following revision added the first layer's input RMSNorm to the workqueue
+path. The event now reads the official BF16 norm weights from the arena,
+converts them to Q20, and normalizes the token embedding before Q projection.
+For ten alternating requests over the first and last valid token IDs, the
+1,024 raw embeddings, 1,024 normalized values, and all 2,048 projection
+outputs per request matched a separate C implementation of the same fixed-point
+arithmetic. Invalid token IDs and bad request markers did not start work.
+This remains only the beginning of one decoder layer; the previous direct
+matrix timings do not include the embedding and RMSNorm work now present in
+the event path, so they are not a matched performance comparison.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row

@@ -63,10 +63,11 @@ exit. `make test-arena-xdp-model MODEL=/path/to/model.safetensors` instead
 uses the official layer-0 Q-projection matrix: the kernel workqueue advances
 through all 2,048 rows in 128-row batches after each packet. Packets alternate
 two token IDs; the workqueue reads their embeddings from resident weights, and
-the test compares both embeddings and all outputs with C references. Do not
+performs first-layer input RMSNorm before the Q projection. The test compares
+embedding, normalized vector, and all output rows with C references. Do not
 run either XDP test in a production network namespace. They are not full-model
 inference: the loader still supplies the resident weights and reads results,
-and no normalization or subsequent decoder layers run in this event path.
+and no subsequent decoder operators or layers run in this event path.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:
@@ -138,7 +139,7 @@ network or kernel event.
 | `make build/infer-arena-bf16` | Build the optional full-model arena path and its operator dependencies. |
 | `make test-arena-bf16` / `make test-arena-int4` | Optional arena operator checks, with `MODEL=...` for real weights. |
 | `make test-arena-xdp` | Live loopback XDP → BPF workqueue → resident BF16 operator check in the current network namespace. |
-| `make test-arena-xdp-model MODEL=...` | Ten alternating token-ID requests using resident embeddings and the first-layer Q-projection matrix, checked against C. |
+| `make test-arena-xdp-model MODEL=...` | Ten alternating token-ID requests using resident embeddings, first-layer RMSNorm, and Q projection, checked against C. |
 | `make clean` | Remove only generated files under `build/`. |
 
 Output names and CLI arguments are unchanged. Tests live in `tests/`, shared

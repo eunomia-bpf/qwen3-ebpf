@@ -41,7 +41,7 @@ static void populate_lut(struct qwen3_arena_bf16_bpf *skel)
     for (bits = 0; bits <= UINT16_MAX; bits++) {
         uint32_t float_bits = bits << 16;
         float value;
-        double scaled, scaled16;
+        double scaled, scaled16, scaled20;
 
         memcpy(&value, &float_bits, sizeof(value));
         scaled = (double)value * 16777216.0;
@@ -52,7 +52,22 @@ static void populate_lut(struct qwen3_arena_bf16_bpf *skel)
         skel->arena->q16_by_bf16[bits] =
             !isfinite(scaled16) || scaled16 > INT32_MAX || scaled16 < INT32_MIN
             ? 0 : (int32_t)(scaled16 + (scaled16 >= 0 ? 0.5 : -0.5));
+        scaled20 = (double)value * 1048576.0;
+        skel->arena->q20_by_bf16[bits] =
+            !isfinite(scaled20) || scaled20 > INT32_MAX || scaled20 < INT32_MIN
+            ? 0 : (int32_t)(scaled20 + (scaled20 >= 0 ? 0.5 : -0.5));
     }
+}
+
+static uint64_t reference_isqrt64(uint64_t value)
+{
+    uint64_t root = 1ULL << 20;
+
+    for (int i = 0; i < 24; i++) {
+        root = (root + value / root) >> 1;
+        root |= 1;
+    }
+    return root;
 }
 
 static int run_synthetic(struct qwen3_arena_bf16_bpf *skel,
@@ -130,6 +145,7 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                          struct qwen3_arena_bf16_work *work,
                          const int32_t *expected, uint32_t total,
                          const int32_t *expected_inputs,
+                         const int32_t *expected_embeddings,
                          const uint32_t *token_ids)
 {
     const __u32 key = 0;
@@ -150,7 +166,8 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
     uint32_t i, attempt;
 
     if (!ifindex || !total || total > QWEN3_ARENA_EVENT_OUTPUTS ||
-        (work->event_use_token && (!expected_inputs || !token_ids))) {
+        (work->event_use_token && (!expected_inputs ||
+                                   !expected_embeddings || !token_ids))) {
         fprintf(stderr, "invalid loopback interface or matrix row count\n");
         return -1;
     }
@@ -248,13 +265,20 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
                         i, work->matrix_output_q16[i], request_expected[i]);
                 goto done;
             }
-        if (work->event_use_token)
-            for (i = 0; i < QWEN3_ARENA_TOKEN_WIDTH; i++)
+        if (work->event_use_token) {
+            for (i = 0; i < QWEN3_ARENA_TOKEN_WIDTH; i++) {
                 if (work->input_q16[i] !=
                     expected_inputs[(attempt % 2) * QWEN3_ARENA_TOKEN_WIDTH + i]) {
+                    fprintf(stderr, "XDP normalized input mismatch at %u\n", i);
+                    goto done;
+                }
+                if (work->embedding_q16[i] !=
+                    expected_embeddings[(attempt % 2) * QWEN3_ARENA_TOKEN_WIDTH + i]) {
                     fprintf(stderr, "XDP embedding mismatch at %u\n", i);
                     goto done;
                 }
+            }
+        }
         if (clock_gettime(CLOCK_MONOTONIC, &now))
             goto done;
         elapsed_ns = (__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
@@ -278,10 +302,12 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     struct safetensors_file file;
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
     uint64_t first_byte, elements, embedding_byte, embedding_elements;
-    int32_t q24[1024], hidden[2][1024], expected[2][2048];
+    uint64_t norm_byte, norm_elements;
+    int32_t q24[1024], hidden[2][1024], normalized[2][1024];
+    int32_t norm_q20[1024], expected[2][2048];
     int32_t direct_outputs[2048];
-    float embedding[1024];
-    const uint8_t *raw, *embedding_raw;
+    float embedding[1024], norm_weights[1024];
+    const uint8_t *raw, *embedding_raw, *norm_raw;
     const uint32_t token_ids[2] = {0, 151935};
     int row, col, token, rc = -1;
 
@@ -292,12 +318,18 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             &elements) || elements != 2048ULL * 1024 ||
         safetensors_find_bf16(&file, "model.embed_tokens.weight",
             &embedding_byte, &embedding_elements) ||
-        embedding_elements != 151936ULL * QWEN3_ARENA_TOKEN_WIDTH)
+        embedding_elements != 151936ULL * QWEN3_ARENA_TOKEN_WIDTH ||
+        safetensors_find_bf16(&file, "model.layers.0.input_layernorm.weight",
+            &norm_byte, &norm_elements) ||
+        norm_elements != QWEN3_ARENA_TOKEN_WIDTH ||
+        safetensors_read_bf16_at(&file, norm_byte, 0,
+                                 QWEN3_ARENA_TOKEN_WIDTH, norm_weights))
         goto done;
     raw = file.mapping + 8 + file.header_length + first_byte;
     embedding_raw = file.mapping + 8 + file.header_length + embedding_byte;
+    norm_raw = file.mapping + 8 + file.header_length + norm_byte;
     memset(work, 0, sizeof(*work));
-    work->model_elements = embedding_elements + elements;
+    work->model_elements = embedding_elements + elements + norm_elements;
     if (bpf_prog_test_run_opts(
             bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
             &opts) || opts.retval || !skel->bss->model_bf16) {
@@ -306,13 +338,25 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     }
     memcpy(skel->bss->model_bf16, embedding_raw, embedding_elements * 2);
     memcpy(skel->bss->model_bf16 + embedding_elements, raw, elements * 2);
+    memcpy(skel->bss->model_bf16 + embedding_elements + elements,
+           norm_raw, norm_elements * 2);
     work->cols = 1024;
     work->rows = QWEN3_ARENA_BF16_ROWS;
     work->resident_weights = 1;
     work->weight_first_bf16 = embedding_elements;
+    work->norm_first_bf16 = embedding_elements + elements;
     work->embedding_vocab = 151936;
     work->event_use_token = 1;
+    for (col = 0; col < 1024; col++) {
+        double scaled = (double)norm_weights[col] * 1048576.0;
+
+        if (!isfinite(scaled) || scaled > INT32_MAX || scaled < INT32_MIN)
+            goto done;
+        norm_q20[col] = (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+    }
     for (token = 0; token < 2; token++) {
+        uint64_t sum_sq_q32 = 0, inv_rms_q16;
+
         if (safetensors_read_bf16_at(&file, embedding_byte,
                 (uint64_t)token_ids[token] * QWEN3_ARENA_TOKEN_WIDTH,
                 QWEN3_ARENA_TOKEN_WIDTH, embedding))
@@ -324,6 +368,16 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                 goto done;
             hidden[token][col] =
                 (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+            sum_sq_q32 += (uint64_t)((int64_t)hidden[token][col] *
+                                     hidden[token][col]);
+        }
+        inv_rms_q16 = (1ULL << 32) /
+            reference_isqrt64(sum_sq_q32 / QWEN3_ARENA_TOKEN_WIDTH + 4295);
+        for (col = 0; col < 1024; col++) {
+            int64_t scaled = ((int64_t)hidden[token][col] *
+                              (int64_t)inv_rms_q16) >> 16;
+            normalized[token][col] =
+                (int32_t)((scaled * norm_q20[col]) >> 20);
         }
         for (row = 0; row < 2048; row++) {
             __s64 sum = 0;
@@ -332,7 +386,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                     (uint64_t)row * 1024, 1024, q24))
                 goto done;
             for (col = 0; col < 1024; col++)
-                sum += (__s64)hidden[token][col] * q24[col];
+                sum += (__s64)normalized[token][col] * q24[col];
             sum >>= 24;
             if (sum > INT32_MAX || sum < INT32_MIN)
                 goto done;
@@ -344,7 +398,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
         __s64 elapsed_ns;
         token = attempt % 2;
 
-        memcpy(work->input_q16, hidden[token], sizeof(hidden[token]));
+        memcpy(work->input_q16, normalized[token], sizeof(normalized[token]));
         if (clock_gettime(CLOCK_MONOTONIC, &begin))
             goto done;
         for (row = 0; row < 2048; row += QWEN3_ARENA_BF16_ROWS) {
@@ -371,7 +425,7 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                attempt + 1, (double)elapsed_ns / 1000000.0);
     }
     rc = run_xdp_event(skel, work, &expected[0][0], 2048,
-                       &hidden[0][0], token_ids);
+                       &normalized[0][0], &hidden[0][0], token_ids);
 done:
     safetensors_close(&file);
     return rc;
@@ -468,7 +522,7 @@ int main(int argc, char **argv)
         expected[1] = (int32_t)work->output_q16[1];
         if (argc == 1 ||
             (strcmp(argv[1], "--xdp-loopback") == 0 ?
-             !run_xdp_event(skel, work, expected, 2, NULL, NULL) :
+             !run_xdp_event(skel, work, expected, 2, NULL, NULL, NULL) :
              !run_model_rows(skel, work, argv[1]))) {
             puts("arena BF16 smoke passed");
             rc = 0;

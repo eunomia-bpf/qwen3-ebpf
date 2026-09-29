@@ -116,10 +116,10 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   position limit is not a validated context capacity for this implementation.
 - The optional BF16 arena keeps model weights in kernel memory. A separate
   XDP-to-BPF-workqueue path accepts token IDs from live packets, loads their
-  embeddings from resident weights, and schedules all batches of one real-weight
-  matrix, including repeated requests. C still schedules the 28 layers in full
-  inference and handles text. No full-model event path or end-to-end speedup
-  has been established.
+  embeddings and first-layer RMSNorm weights from resident storage, and
+  schedules all batches of one real-weight Q projection, including repeated
+  requests. C still schedules the 28 layers in full inference and handles text.
+  No full-model event path or end-to-end speedup has been established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

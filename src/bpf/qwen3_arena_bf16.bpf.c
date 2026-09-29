@@ -23,6 +23,7 @@ struct {
 __u16 __arena weight_bf16[QWEN3_ARENA_BF16_ROWS][QWEN3_ARENA_BF16_COLS];
 __s32 __arena q24_by_bf16[1 << 16];
 __s32 __arena q16_by_bf16[1 << 16];
+__s32 __arena q20_by_bf16[1 << 16];
 __u16 __arena *model_bf16;
 
 extern void *bpf_arena_alloc_pages(void *map, void *addr, __u32 page_cnt,
@@ -167,8 +168,73 @@ static long load_token_embedding(__u32 col, void *ctx)
         return 1;
     }
     bits = model_bf16[first];
-    state->input_q16[bounded_col] =
+    state->embedding_q16[bounded_col] =
         q16_by_bf16[bits];
+    return 0;
+}
+
+static __always_inline __u64 event_isqrt64(__u64 value)
+{
+    __u64 root = 1ULL << 20;
+    int i;
+
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 24; i++) {
+        root = (root + value / root) >> 1;
+        root |= 1;
+    }
+    return root;
+}
+
+static long event_norm_sum(__u32 tile, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_tile = tile & 7;
+    __u64 sum = 0;
+    int i;
+
+    if (!state) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __s64 x = state->embedding_q16[bounded_tile * 128 + i];
+        sum += (__u64)(x * x);
+    }
+    state->norm_sum_sq_q32 += sum;
+    return 0;
+}
+
+static long event_norm_apply(__u32 tile, void *ctx)
+{
+    const __u32 key = 0;
+    struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
+    __u32 bounded_tile = tile & 7;
+    int i;
+
+    if (!state || !model_bf16) {
+        *(__u32 *)ctx = 1;
+        return 1;
+    }
+#pragma clang loop unroll(disable)
+    for (i = 0; i < 128; i++) {
+        __u32 index = bounded_tile * 128 + i;
+        __u64 first = state->norm_first_bf16 + index;
+        __s64 normalized;
+        __u16 bits;
+
+        if (first >= state->model_elements) {
+            *(__u32 *)ctx = 1;
+            return 1;
+        }
+        bits = model_bf16[first];
+        normalized = ((__s64)state->embedding_q16[index] *
+                      (__s64)state->norm_inv_rms_q16) >> 16;
+        state->input_q16[index] =
+            (__s32)((normalized * q20_by_bf16[bits]) >> 20);
+    }
     return 0;
 }
 
@@ -207,6 +273,28 @@ static int event_callback(void *map, int *key, void *value)
         }
         bpf_loop(QWEN3_ARENA_TOKEN_WIDTH, load_token_embedding,
                  &callback_ctx, 0);
+        if (callback_ctx) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        if (state->norm_first_bf16 > state->model_elements ||
+            QWEN3_ARENA_TOKEN_WIDTH >
+                state->model_elements - state->norm_first_bf16) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->norm_sum_sq_q32 = 0;
+        callback_ctx = 0;
+        bpf_loop(8, event_norm_sum, &callback_ctx, 0);
+        if (callback_ctx) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
+        state->norm_inv_rms_q16 =
+            (1ULL << 32) / event_isqrt64(state->norm_sum_sq_q32 /
+                                          QWEN3_ARENA_TOKEN_WIDTH + 4295);
+        callback_ctx = 0;
+        bpf_loop(8, event_norm_apply, &callback_ctx, 0);
         if (callback_ctx) {
             job->status = QWEN3_EVENT_ERROR;
             return 0;

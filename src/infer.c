@@ -251,6 +251,14 @@ static int open_engine(struct qwen3_engine *engine, const char *model_path,
         engine->arena_skel->arena->q24_by_bf16[bits] =
             engine->arena_weight_valid[bits]
             ? (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5)) : 0;
+        scaled = (double)value * 65536.0;
+        engine->arena_skel->arena->q16_by_bf16[bits] =
+            isfinite(scaled) && scaled <= INT32_MAX && scaled >= INT32_MIN
+            ? (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5)) : 0;
+        scaled = (double)value * 1048576.0;
+        engine->arena_skel->arena->q20_by_bf16[bits] =
+            isfinite(scaled) && scaled <= INT32_MAX && scaled >= INT32_MIN
+            ? (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5)) : 0;
     }
     {
         size_t data_offset = 8 + (size_t)engine->model.header_length;

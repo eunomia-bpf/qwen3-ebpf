@@ -254,8 +254,8 @@ boundaries. The changes remove
 unnecessary ICMP traffic and improve the observed client path, but they do
 not establish a sustained speedup over the CLI.
 
-A 131-token technical prose fixture in `tests/long-context.txt` exercised
-the live XDP path with the official tokenizer and model. Against the resident
+An earlier 131-token text-mode invocation was described as using the technical
+prose fixture, but its exact input IDs were not retained. Against the resident
 CLI's per-prefix fixed-point argmax, the first 130 XDP replies selected the
 same token IDs at every position. Their Q16 best logits matched exactly
 through position 35, then differed at 93 of the 130 positions; the largest
@@ -279,7 +279,7 @@ next token. An automated official-model test checked the acknowledgement for
 token `0`, then returned ID `220` and Q16 logit `746817` after token `1`,
 matching the resident CLI. A pinned four-token `[0, 1, 2, 3]` prefill run
 returned the same final ID/logit as the all-logits path in 1.862 s, versus
-2.085 s for a previous CLI observation. On the 131-token text fixture, XDP
+2.085 s for a previous CLI observation. On that earlier text-mode input, XDP
 prefill returned ID `576` and Q16 logit `1060767` in 57.334 s, versus the
 resident CLI's ID `576`, Q16 logit `1060769`, and 57.631 s. These are
 single shared-host observations after model loading, with somewhat different
@@ -294,6 +294,25 @@ Across all three observations, XDP's median was 60.964 s and CLI's was
 57.631 s. The shared host varied substantially; no stable long-prompt
 latency advantage was demonstrated. Callback CPU placement was not directly
 recorded in these standalone-loader runs.
+
+On 2026-10-01, an exact-file check of `tests/long-context.txt` used SHA-256
+`b8467f4c7f02661c38afe721418e1c192f2b54b2db733cab53501c7e02007ef9`.
+The file includes a final LF. Transformers 5.14.1 and the official tokenizer
+encoded it as 131 IDs ending in `624`; the official BF16 model selected next
+token `785` with top logit `16.25`. The XDP client sent those exact IDs as raw
+tokens and returned `785` with Q16 logit `1055116`. Reading the file byte for
+byte through the C tokenizer and XDP client also sent the same 131 IDs and
+returned the same result. `make test-tokenizer` checks every ID against the
+official reference for this file. The resident arena CLI on those exact IDs
+returned `785` with Q16 logit `1055106`, ten Q16 units below XDP. Thus this
+one matched-input next-token check agrees on argmax across BF16, C fixed-point,
+and live XDP; it does not establish general language quality or full-logit
+agreement. The earlier `576` observation cannot be treated as a result for
+these exact file bytes because its input IDs were not preserved. The BF16
+reference used `tests/reference_score.py`, which now reports the last input ID,
+final argmax and top logits and can print all input IDs for exact replay.
+The text-mode XDP replay used `xargs -0` with input redirected from the file,
+which preserved the final LF instead of stripping it in shell substitution.
 
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row

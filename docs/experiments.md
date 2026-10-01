@@ -358,6 +358,18 @@ one differed by `0.125` BF16 logit. This is stronger evidence for the live
 event path than isolated short prompts, but it is still only two excerpts and
 does not support a general quality or speedup claim.
 
+A final small BPF row-loop change used separate even/odd accumulators instead
+of one serial accumulator; the synthetic arena check covers both 3,072 and
+3,071 columns. The official-weight row test and complete XDP attention smoke
+passed on the Linux 6.17 arm64 test host. In three interspersed 131-token
+full-projection XDP runs per version, the original took `93.170`, `88.794`,
+and `94.062` seconds; the changed version took `83.445`, `87.350`, and
+`87.149` seconds. Their medians were `93.170` and `87.149` seconds, about
+`6.5%` lower for this workload. All 131 token IDs and Q16 logits were
+byte-for-byte identical across versions. This is a shared-host observation,
+not an isolated throughput benchmark, and it does not change the comparison
+with the faster user-space BF16 baseline above.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

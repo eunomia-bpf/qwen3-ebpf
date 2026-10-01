@@ -124,7 +124,7 @@ static long compute_row(__u32 row, void *ctx)
     struct qwen3_arena_bf16_work *state = bpf_map_lookup_elem(&work, &key);
     __u32 bounded_row = row & (QWEN3_ARENA_BF16_ROWS - 1);
     __u16 __arena *weights;
-    __s64 sum = 0;
+    __s64 even = 0, odd = 0;
     int i;
 
     (void)ctx;
@@ -141,15 +141,15 @@ static long compute_row(__u32 row, void *ctx)
         weights = weight_bf16[bounded_row];
     }
 #pragma clang loop unroll(disable)
-    for (i = 0; i < QWEN3_ARENA_BF16_COLS; i++) {
-        __u16 bits;
-
+    for (i = 0; i < QWEN3_ARENA_BF16_COLS; i += 2) {
         if (i >= state->cols)
             break;
-        bits = weights[i];
-        sum += (__s64)state->input_q16[i] * q24_by_bf16[bits];
+        even += (__s64)state->input_q16[i] * q24_by_bf16[weights[i]];
+        if (i + 1 < state->cols)
+            odd += (__s64)state->input_q16[i + 1] *
+                   q24_by_bf16[weights[i + 1]];
     }
-    state->output_q16[bounded_row] = sum >> 24;
+    state->output_q16[bounded_row] = (even + odd) >> 24;
     if (state->track_argmax &&
         state->output_q16[bounded_row] > state->best_q16) {
         state->best_q16 = state->output_q16[bounded_row];

@@ -104,18 +104,23 @@ static int run_synthetic(struct qwen3_arena_bf16_bpf *skel,
         for (col = 0; col < QWEN3_ARENA_BF16_COLS; col++)
             skel->arena->weight_bf16[row][col] =
                 samples[(row + col) % (sizeof(samples) / sizeof(samples[0]))];
-    if (run_kernel(skel, work, QWEN3_ARENA_BF16_ROWS))
-        return -1;
-    for (row = 0; row < QWEN3_ARENA_BF16_ROWS; row++) {
-        __s64 expected = 0;
-        for (col = 0; col < QWEN3_ARENA_BF16_COLS; col++) {
-            __u16 bits = skel->arena->weight_bf16[row][col];
-            expected += (__s64)work->input_q16[col] *
-                        skel->arena->q24_by_bf16[bits];
-        }
-        if (work->output_q16[row] != expected >> 24) {
-            fprintf(stderr, "arena BF16 row %d mismatch\n", row);
+    for (int cols = QWEN3_ARENA_BF16_COLS;
+         cols >= QWEN3_ARENA_BF16_COLS - 1; cols--) {
+        work->cols = cols;
+        if (run_kernel(skel, work, QWEN3_ARENA_BF16_ROWS))
             return -1;
+        for (row = 0; row < QWEN3_ARENA_BF16_ROWS; row++) {
+            __s64 expected = 0;
+            for (col = 0; col < cols; col++) {
+                __u16 bits = skel->arena->weight_bf16[row][col];
+                expected += (__s64)work->input_q16[col] *
+                            skel->arena->q24_by_bf16[bits];
+            }
+            if (work->output_q16[row] != expected >> 24) {
+                fprintf(stderr, "arena BF16 row %d mismatch at %d columns\n",
+                        row, cols);
+                return -1;
+            }
         }
     }
     return 0;

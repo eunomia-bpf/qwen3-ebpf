@@ -127,12 +127,15 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   prefix matches an independent C fixed-point reference. The event path now
   also runs final RMSNorm, full-vocabulary projection, and argmax, then returns
   the token ID and logit through an XDP-transmitted UDP result packet after a
-  client poll. An optional standalone loader now installs that XDP path and
-  leaves model execution in BPF; the separate full-inference CLI still uses C
-  for scheduling and text. The matched single-token benchmark is described in
+  client poll. An optional standalone loader installs that XDP path and leaves
+  model execution in BPF. Context-only packets can update all layers and KV
+  without a vocabulary projection before the final result-producing packet.
+  The separate full-inference CLI still uses C for scheduling and text. The
+  matched single-token benchmark is described in
   [Experiments](docs/experiments.md). Short two- and four-token XDP sequences
-  match the resident CLI's final result; broader multi-token quality and
-  production throughput are not established.
+  match the resident CLI's final result; a 131-token text input kept the same
+  final token with a small Q16 logit difference. Broader multi-token quality
+  and production throughput are not established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

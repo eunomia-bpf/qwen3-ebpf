@@ -79,14 +79,17 @@ single-token prefix from two through 28 official-weight layers, including
 per-layer KV isolation and exact final hidden vectors against C references.
 It then checks final RMSNorm and full-vocabulary argmax against C and receives
 the token ID and Q16 logit through a real XDP-transmitted UDP result packet.
-The request packet uses `Q3BP` followed by big-endian token ID and position.
-Because inference completes asynchronously, the client sends a 20-byte `Q3BR`
+The result-producing request packet uses `Q3BP` followed by big-endian token
+ID and position. `Q3BF` has the same fields but only updates the 28-layer
+state and KV cache; it skips the final vocabulary projection. Because
+inference completes asynchronously, the client sends a 20-byte `Q3BR`
 poll with the expected completed-request counter in bytes 4–7; after completion
 XDP returns `Q3BA`, token ID (bytes 4–7), signed Q16 logit (bytes 8–15), and
-counter (bytes 16–19), all big-endian. Valid polls sent before completion or
-with an old counter are consumed without a reply. Do not run these XDP tests
-in a production network namespace. Two- and four-token 28-layer XDP
-sequences have also matched the resident CLI's final token and logit; broader
+counter (bytes 16–19), all big-endian. A completed `Q3BF` request instead
+returns `Q3BK` with the same counter and zero result fields. Valid polls sent
+before completion or with an old counter are consumed without a reply. Do not
+run these XDP tests in a production network namespace. Two- and four-token
+28-layer XDP sequences matched the resident CLI's final token and logit; broader
 multi-token correctness and concurrent session isolation remain unverified.
 
 To run that event path without the smoke-test driver, build the standalone
@@ -100,21 +103,24 @@ sudo ./build/serve-xdp /path/to/model.safetensors lo
 ./build/xdp-client 127.0.0.1 9707 11 1879 0
 ./build/xdp-client 127.0.0.1 --tokenizer /path/to/tokenizer.json \
   --prompt "Hello, world!"
+./build/xdp-client 127.0.0.1 --prefill --tokenizer /path/to/tokenizer.json \
+  --prompt "Hello, world!"
 ```
 
 The loader maps the official model, copies its BF16 payload into the BPF arena,
 sets the 28 layer offsets, initializes the workqueue, and attaches XDP. After
 startup, inference scheduling, weights, KV state, argmax, and UDP result replies
 stay in BPF; the loader only keeps the BPF link alive and detaches it on
-SIGINT/SIGTERM. Send the `Q3BP`/`Q3BR` packets described above to UDP/49002
+SIGINT/SIGTERM. Send the `Q3BP`/`Q3BF`/`Q3BR` packets to UDP/49002
 on that interface. This is a single-session, raw-token prototype, not a
 general socket service: tokenization, concurrent sessions, and
 arbitrary-length generation are not provided by this loader.
 The client sends sequential token IDs and polls for each result. Its optional
 text mode uses the existing user-space tokenizer but does no model computation.
-Start a fresh loader for each sequence because the
-request counter is global to this single-session prototype. Avoid attaching
-it to a production interface.
+With `--prefill`, all but the final token use `Q3BF` and only the final token
+computes vocabulary logits, matching a normal prompt-forward workload.
+Start a fresh loader for each sequence because the request counter is global
+to this single-session prototype. Avoid attaching it to a production interface.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:

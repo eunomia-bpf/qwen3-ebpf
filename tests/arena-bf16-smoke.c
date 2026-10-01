@@ -920,6 +920,109 @@ done:
     return rc;
 }
 
+static int run_xdp_prefill(struct qwen3_arena_bf16_bpf *skel,
+                           struct qwen3_arena_bf16_work *work)
+{
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons(49002),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    struct timeval timeout = {.tv_sec = 2};
+    struct qwen3_event_state job;
+    struct bpf_link *link = NULL;
+    struct timespec begin, now;
+    unsigned int ifindex = if_nametoindex("lo");
+    uint32_t key = 0, expected;
+    int fd = -1, poll_fd = -1, rc = -1;
+
+    if (!ifindex || bpf_map_lookup_elem(bpf_map__fd(skel->maps.event),
+                                        &key, &job))
+        return -1;
+    expected = job.completed_requests;
+    work->event_layer_count = QWEN3_EVENT_MAX_LAYERS;
+    work->event_final_logits = 1;
+    link = bpf_program__attach_xdp(skel->progs.qwen3_event_xdp, ifindex);
+    if (!link || libbpf_get_error(link)) {
+        link = NULL;
+        goto done;
+    }
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    poll_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0 || poll_fd < 0 ||
+        setsockopt(poll_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)))
+        goto done;
+    for (uint32_t pos = 0; pos < 2; pos++) {
+        unsigned char request[12] = {'Q', '3', 'B', pos ? 'P' : 'F'};
+        unsigned char poll[20] = {'Q', '3', 'B', 'R'};
+        unsigned char reply[20];
+        uint32_t count = ++expected;
+        ssize_t received;
+
+        request[7] = pos;
+        request[11] = pos;
+        poll[4] = count >> 24;
+        poll[5] = count >> 16;
+        poll[6] = count >> 8;
+        poll[7] = count;
+        if (clock_gettime(CLOCK_MONOTONIC, &begin) ||
+            sendto(fd, request, sizeof(request), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(request))
+            goto done;
+        do {
+            if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event),
+                                    &key, &job) ||
+                job.status == QWEN3_EVENT_ERROR)
+                goto done;
+            if (job.status == QWEN3_EVENT_DONE &&
+                job.completed_requests == count)
+                break;
+            usleep(100);
+            if (clock_gettime(CLOCK_MONOTONIC, &now))
+                goto done;
+        } while ((__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
+                 now.tv_nsec - begin.tv_nsec < 30000000000LL);
+        if (job.status != QWEN3_EVENT_DONE ||
+            job.completed_requests != count ||
+            work->event_next_position != pos + 1 ||
+            (pos == 0 && (work->event_stage != QWEN3_EVENT_STAGE_DOWN ||
+                          job.result_token_id != 0 ||
+                          job.result_logit_q16 != 0)) ||
+            (pos == 1 && (job.result_token_id != 220 ||
+                          job.result_logit_q16 != 746817)))
+            goto done;
+        if (sendto(poll_fd, poll, sizeof(poll), 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) != sizeof(poll))
+            goto done;
+        received = recvfrom(poll_fd, reply, sizeof(reply), 0, NULL, NULL);
+        if (received != sizeof(reply) ||
+            memcmp(reply, pos ? "Q3BA" : "Q3BK", 4) ||
+            reply[16] != poll[4] || reply[17] != poll[5] ||
+            reply[18] != poll[6] || reply[19] != poll[7])
+            goto done;
+        if (pos == 0)
+            for (int i = 4; i < 16; i++)
+                if (reply[i])
+                    goto done;
+    }
+    puts("XDP prefill acknowledgement and final token passed");
+    rc = 0;
+done:
+    if (rc)
+        fprintf(stderr, "XDP prefill failed: status=%llu completions=%u next=%u\n",
+                (unsigned long long)job.status, job.completed_requests,
+                work->event_next_position);
+    if (fd >= 0)
+        close(fd);
+    if (poll_fd >= 0)
+        close(poll_fd);
+    bpf_link__destroy(link);
+    work->event_layer_count = 0;
+    work->event_final_logits = 0;
+    return rc;
+}
+
 static int find_matrix_offset(struct safetensors_file *file, const char *name,
                               uint64_t elements, uint64_t *byte)
 {
@@ -1546,6 +1649,8 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             if (rc)
                 break;
         }
+    if (!rc && with_attention)
+        rc = run_xdp_prefill(skel, work);
 done:
     free(layer_hidden);
     free(layer_key);

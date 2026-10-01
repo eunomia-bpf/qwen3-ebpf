@@ -50,14 +50,17 @@ per-layer offsets into the resident full-model arena; KV slots include the
 layer index. The test checks every official-weight single-token layer prefix
 against independent C fixed-point arithmetic. It accepts consecutive
 positions in a single-session 256-position cache; a position-zero packet starts
-a new sequence. After the last layer, the workqueue performs final RMSNorm,
-all 151,936 vocabulary rows, and argmax. Since the asynchronous work item no
-longer owns the original packet, a later UDP poll with magic `Q3BR` and the
-completed-request counter receives a 20-byte `Q3BA` packet containing token
-ID, signed Q16 logit, and counter. XDP swaps addresses and ports and transmits
-that result without a user-space inference worker. Multi-token correctness
-across all 28 layers and concurrent sessions remain unverified. The receive
-hook only queues work; full inference does not run inline in XDP.
+a new sequence. A `Q3BF` context packet finishes after the last layer and
+updates KV without computing vocabulary logits. A `Q3BP` result packet also
+runs final RMSNorm, all 151,936 vocabulary rows, and argmax. Since the
+asynchronous work item no longer owns the original packet, a later `Q3BR`
+poll with the completed-request counter receives a 20-byte `Q3BK` completion
+acknowledgement or `Q3BA` token/logit result. XDP swaps addresses and ports
+and transmits that reply without a user-space inference worker. A 131-token
+sequence kept the resident CLI's final token with a small fixed-point logit
+difference; broader language quality and concurrent sessions remain
+unverified. The receive hook only queues work; full inference does not run
+inline in XDP.
 
 | Kernel program | Role in full inference |
 | --- | --- |

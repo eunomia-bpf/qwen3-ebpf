@@ -79,6 +79,7 @@ struct qwen3_arena_bf16_work {
     __u32 event_layer_count;
     __u32 event_layer;
     __u32 event_final_logits;
+    __u32 event_emit_logits;
     __u32 attention_past_cursor;
     __u32 event_stage;
     __u32 embedding_vocab;

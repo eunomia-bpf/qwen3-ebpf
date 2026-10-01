@@ -272,6 +272,29 @@ These single runs do not show a long-context performance benefit, and
 argmax agreement with a fixed-point CLI is not a full language-quality
 evaluation against BF16 reference logits.
 
+The event path now accepts context-only `Q3BF` packets: all 28 layers and KV
+updates run in BPF, but the vocabulary projection is skipped and XDP returns
+a `Q3BK` completion acknowledgement. A final `Q3BP` packet still returns the
+next token. An automated official-model test checked the acknowledgement for
+token `0`, then returned ID `220` and Q16 logit `746817` after token `1`,
+matching the resident CLI. A pinned four-token `[0, 1, 2, 3]` prefill run
+returned the same final ID/logit as the all-logits path in 1.862 s, versus
+2.085 s for a previous CLI observation. On the 131-token text fixture, XDP
+prefill returned ID `576` and Q16 logit `1060767` in 57.334 s, versus the
+resident CLI's ID `576`, Q16 logit `1060769`, and 57.631 s. These are
+single shared-host observations after model loading, with somewhat different
+timing boundaries; the small long-prompt difference does not establish a
+reliable speedup. The earlier 76.715 s XDP all-logits path computed 131
+vocabulary projections, whereas the 57.631 s CLI prompt path computed only
+one. A closer CLI scoring run computed 130 vocabulary projections plus NLL
+in 76.590 s. Those figures must not be used as a like-for-like speed claim.
+Two further interleaved long-prompt runs on the same pinned client/CLI CPU
+measured 60.964/70.089 s for XDP prefill and 56.756/65.446 s for CLI.
+Across all three observations, XDP's median was 60.964 s and CLI's was
+57.631 s. The shared host varied substantially; no stable long-prompt
+latency advantage was demonstrated. Callback CPU placement was not directly
+recorded in these standalone-loader runs.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

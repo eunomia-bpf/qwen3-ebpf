@@ -994,7 +994,7 @@ static int event_callback(void *map, int *key, void *value)
                     job->status = QWEN3_EVENT_ERROR;
                 return 0;
             }
-            if (state->event_final_logits) {
+            if (state->event_final_logits && state->event_emit_logits) {
                 job->layers_finish_ns = bpf_ktime_get_ns();
                 if (state->final_norm_first_bf16 > state->model_elements ||
                     QWEN3_ARENA_TOKEN_WIDTH >
@@ -1125,7 +1125,7 @@ int qwen3_event_xdp(struct xdp_md *ctx)
             return XDP_DROP;
         token = job->result_token_id;
         logit = (__u64)job->result_logit_q16;
-        payload[3] = 'A';
+        payload[3] = state->event_emit_logits ? 'A' : 'K';
         payload[4] = token >> 24;
         payload[5] = token >> 16;
         payload[6] = token >> 8;
@@ -1149,7 +1149,8 @@ int qwen3_event_xdp(struct xdp_md *ctx)
         udp->check = 0;
         return XDP_TX;
     }
-    if (payload[3] != 'P')
+    if (payload[3] != 'P' &&
+        (payload[3] != 'F' || !state->event_final_logits))
         return XDP_PASS;
     if (state->event_use_token) {
         if (payload + 8 > (unsigned char *)end)
@@ -1190,6 +1191,9 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     state->base_index = 0;
     state->event_token_id = token_id;
     state->event_position = position;
+    state->event_emit_logits = payload[3] == 'P';
+    job->result_token_id = 0;
+    job->result_logit_q16 = 0;
     if (state->event_qkv) {
         if (event_begin_layer(state, 0)) {
             job->status = QWEN3_EVENT_ERROR;

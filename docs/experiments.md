@@ -215,6 +215,19 @@ throughput, or production network performance. Unpinned workqueue placement
 changed latency by roughly 2× on this heterogeneous CPU, so CPU placement
 must be controlled in comparisons.
 
+The standalone XDP loader was then built with the same official BF16 model
+and attached to loopback in the isolated test container. A live UDP request
+for token `0` at position zero returned token `9` and Q16 logit `739605`;
+SIGINT detached XDP. In a separate loader session, four consecutive packets
+for token IDs `[0, 1, 2, 3]` at positions zero through three each completed
+and returned a UDP result. At position one, the event path returned token
+`220`, Q16 logit `746817`, exactly matching `infer-arena-bf16` for `[0, 1]`.
+At position three, it returned token `2`, Q16 logit `806121`, again exactly
+matching the same CLI for `[0, 1, 2, 3]`. This validates KV reuse and final
+argmax for these short multi-token sequences through the standalone live XDP
+path; it does not establish long-context quality, full-vocabulary logit
+agreement for every position, concurrent sessions, or generation quality.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

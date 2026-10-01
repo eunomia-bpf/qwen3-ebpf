@@ -84,8 +84,9 @@ Because inference completes asynchronously, the client sends a 20-byte `Q3BR`
 poll with the expected completed-request counter in bytes 4–7; after completion
 XDP returns `Q3BA`, token ID (bytes 4–7), signed Q16 logit (bytes 8–15), and
 counter (bytes 16–19), all big-endian. Do not run these XDP tests in a
-production network namespace. Multi-token 28-layer correctness and concurrent
-session isolation remain unverified.
+production network namespace. Two- and four-token 28-layer XDP sequences have
+also matched the resident CLI's final token and logit; broader multi-token
+correctness and concurrent session isolation remain unverified.
 
 To run that event path without the smoke-test driver, build the standalone
 loader and attach it to a disposable interface:

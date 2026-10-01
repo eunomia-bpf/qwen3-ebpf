@@ -130,7 +130,8 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   client poll. An optional standalone loader now installs that XDP path and
   leaves model execution in BPF; the separate full-inference CLI still uses C
   for scheduling and text. The matched single-token benchmark is described in
-  [Experiments](docs/experiments.md); multi-token 28-layer quality and
+  [Experiments](docs/experiments.md). Short two- and four-token XDP sequences
+  match the resident CLI's final result; broader multi-token quality and
   production throughput are not established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.

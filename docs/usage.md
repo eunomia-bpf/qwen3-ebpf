@@ -89,8 +89,10 @@ counter (bytes 16–19), all big-endian. A completed `Q3BF` request instead
 returns `Q3BK` with the same counter and zero result fields. Valid polls sent
 before completion or with an old counter are consumed without a reply. Do not
 run these XDP tests in a production network namespace. Two- and four-token
-28-layer XDP sequences matched the resident CLI's final token and logit; broader
-multi-token correctness and concurrent session isolation remain unverified.
+28-layer XDP sequences matched the resident CLI's final token and logit. On
+two longer exact-input excerpts, 251 of 256 per-prefix argmax IDs matched
+the official BF16 reference; this is not a broad model-quality validation.
+Concurrent session isolation remains unimplemented.
 
 To run that event path without the smoke-test driver, build the standalone
 loader and attach it to a disposable interface:

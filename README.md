@@ -5,19 +5,13 @@
 [Quick start](#quick-start) · [Architecture](docs/architecture.md) ·
 [Usage & tests](docs/usage.md) · [Experiments](docs/experiments.md) · [MIT license](LICENSE)
 
-An experimental C/libbpf implementation of Qwen3-0.6B forward
-computation in Linux eBPF. The current milestone runs **all 28 decoder layers
-for multi-token contexts**, projects to the full vocabulary, and produces the
-next token ID in the kernel. Greedy decoding can reuse the cache to produce
-additional token IDs. The KV cache lives in a BPF array map; the attention
-operator writes new K/V pairs and scans up to 256 prior positions per
-invocation using `bpf_loop`.
-The default host path loads and converts official BF16 weights, dispatches
-bounded BPF tiles, and reads results; an optional arena path instead preloads
-the model's BF16 payload into a BPF arena for exact Q24 lookup. Model arithmetic
-and argmax run in eBPF. A C
-ByteLevel/BPE tokenizer handles text at the edge. No model weights or tokenizer
-data are distributed here.
+An experimental C/libbpf implementation of Qwen3-0.6B forward computation in
+Linux eBPF. It runs **all 28 decoder layers**, maintains a kernel KV cache,
+projects to the full vocabulary, and returns a next-token ID. The default CLI
+uses C to schedule bounded BPF operators. A separate XDP path instead keeps
+BF16 model weights in a BPF arena, schedules inference through a BPF workqueue
+after a real packet, and returns the result in a UDP packet. Text tokenization
+remains client-side. No model weights or tokenizer data are distributed here.
 
 ## Quick start
 
@@ -50,6 +44,10 @@ Text mode writes decoded bytes to stdout and diagnostics to stderr. The driver
 loads temporary BPF programs and maps; it does not attach to network interfaces.
 The CLI and existing `build/` executable names remain unchanged.
 
+For live packet-triggered inference, see the [XDP loader and client
+instructions](docs/usage.md#build-and-run). Use a disposable test network
+namespace or interface; this prototype is not a production network service.
+
 ## How it works
 
 ```mermaid
@@ -61,13 +59,14 @@ flowchart LR
     D -->|next token| A
 ```
 
-C schedules multiple bounded BPF invocations and supplies embeddings and RoPE
-trigonometric inputs. On the default path, C converts active BF16 weight rows
-to Q24; on the optional resident path, BPF reads BF16 weights from its arena.
-BPF performs
-matrix operations, normalization, attention, MLP operations, and argmax.
-This is not a single long-running kernel program, a GPU profiler, or a
-user-space LLM called by an eBPF hook.
+The diagram shows the default CLI: C schedules multiple bounded BPF
+invocations, supplies embeddings and RoPE inputs, and converts active BF16
+weight rows to Q24. BPF performs matrix operations, normalization, attention,
+MLP operations, and argmax. The separate live XDP path loads BF16 weights into
+a BPF arena once; packet arrivals trigger a BPF workqueue to schedule all 28
+layers and send a UDP result. Its C loader keeps the BPF link alive, while its
+client supplies token IDs or performs text tokenization. Neither path calls a
+user-space LLM from an eBPF hook.
 
 [Architecture and operator map →](docs/architecture.md)
 
@@ -76,11 +75,12 @@ user-space LLM called by an eBPF hook.
 ```text
 src/
   infer.c                 Inference CLI and operator scheduling
+  serve_xdp.c             Standalone live XDP loader
   safetensors.c           Model loading and fixed-point weight conversion
   qwen3_tokenizer.c        ByteLevel/BPE tokenizer
   bpf/                    Default operators and optional BF16 arena backend
 include/                  Shared host/BPF types and interfaces
-tests/                    Operator, model-reader, and tokenizer smoke tests
+tests/                    Smoke tests and XDP token/UDP client
 experiments/              Standalone matvec, INT4, INT8, and INT4 arena kernels
 docs/
   architecture.md         Execution model and implementation boundaries
@@ -114,31 +114,16 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   drop-in inference replacements.
 - The KV cache costs about 224 KiB per requested position. The model's 40,960
   position limit is not a validated context capacity for this implementation.
-- The optional BF16 arena keeps model weights in kernel memory. A separate
-  XDP-to-BPF-workqueue path accepts token IDs from live packets, loads their
-  embeddings and first-layer RMSNorm weights from resident storage, and
-  schedules all batches of the real-weight first-layer Q/K/V projections,
-  then applies head-wise Q/K RMSNorm and position-dependent RoPE. A separate
-  event check also stores first-layer K/V in a kernel map and computes
-  attention over consecutive token packets, followed by the output projection,
-  residual addition, post-attention RMSNorm, and the complete first-layer MLP.
-  The event workqueue now also schedules all 28 layers using the official
-  resident weights and separate per-layer KV slots; each single-token layer
-  prefix matches an independent C fixed-point reference. The event path now
-  also runs final RMSNorm, full-vocabulary projection, and argmax, then returns
-  the token ID and logit through an XDP-transmitted UDP result packet after a
-  client poll. An optional standalone loader installs that XDP path and leaves
-  model execution in BPF. Context-only packets can update all layers and KV
-  without a vocabulary projection before the final result-producing packet.
-  The separate full-inference CLI still uses C for scheduling and text. The
-  single-token comparison against that BPF-operator CLI is described in
-  [Experiments](docs/experiments.md). Short two- and four-token XDP sequences
-  match the resident CLI's final result. On exact 125- and 131-token inputs,
-  XDP and official BF16 agreed on the final token; 251 of 256 online
-  per-prefix argmax IDs matched exactly, and four of the five differences were
-  BF16 top-score ties. No speed benefit over the official user-space BF16 CPU
-  baseline has been demonstrated. Broader model quality and production
-  throughput remain unestablished.
+- The XDP path keeps BF16 weights in kernel memory and runs all 28 layers,
+  KV updates, full-vocabulary projection, and argmax in BPF. A loader must
+  remain running to hold the XDP link. Requests are raw token IDs, results
+  require a UDP poll, and the service has one global session rather than
+  concurrent clients. The XDP KV capacity is limited to 256 positions.
+- On two exact 125- and 131-token excerpts, XDP and official BF16 agreed on
+  the final token; 251 of 256 online per-prefix argmax IDs matched. Four of
+  the five differences were BF16 top-score ties. This is not a general
+  model-quality evaluation. **No speed benefit over one-core user-space BF16
+  inference was demonstrated.**
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

@@ -198,6 +198,23 @@ multiplication error, exposed at layer four, and passed only after that error
 was corrected. This does not yet establish multi-token full-model correctness,
 vocabulary argmax, a network reply, or a matched performance benefit.
 
+The full event continuation now computes final RMSNorm and all 151,936
+vocabulary logits in BPF, records the argmax, and returns it on a subsequent
+XDP UDP poll. Three repeated full-model packet requests returned token `9`
+and Q16 logit `739605`, matching both an independent C fixed-point reference
+and the existing full-model arena CLI. The XDP result was received over UDP,
+not merely read from a map. On the same Linux 6.17 arm64 host, with the process
+and workqueue on Cortex-X925 CPU 5, packet-send-to-result was 580.090–580.711
+ms, versus 0.813–0.817 s for the existing arena CLI pinned to CPU 5 (about
+29% lower latency). On Cortex-A725 CPU 0, the corresponding ranges were
+1221.591–1222.465 ms and 1.858–1.860 s (about 34% lower latency). Both clocks
+start after model loading; the XDP number includes the result poll, while the
+CLI number ends when the token is calculated. These are single-token,
+single-session observations, not a claim about multi-token quality, sustained
+throughput, or production network performance. Unpinned workqueue placement
+changed latency by roughly 2× on this heterogeneous CPU, so CPU placement
+must be controlled in comparisons.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

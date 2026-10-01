@@ -10,6 +10,7 @@
 #define QWEN3_ARENA_TOKEN_WIDTH 1024
 #define QWEN3_EVENT_KV_LIMIT 256
 #define QWEN3_EVENT_MAX_LAYERS 28
+#define QWEN3_EVENT_VOCAB 151936
 #define QWEN3_ARENA_MODEL_MAX_BF16 (768u * 1024u * 1024u)
 
 #define QWEN3_EVENT_READY 1u
@@ -24,6 +25,8 @@
 #define QWEN3_EVENT_STAGE_GATE 6u
 #define QWEN3_EVENT_STAGE_UP 7u
 #define QWEN3_EVENT_STAGE_DOWN 8u
+#define QWEN3_EVENT_STAGE_FINAL_NORM 9u
+#define QWEN3_EVENT_STAGE_LOGITS 10u
 
 struct qwen3_event_state {
     struct bpf_wq work;
@@ -32,6 +35,10 @@ struct qwen3_event_state {
     __u32 completed_requests;
     __u64 start_ns;
     __u64 finish_ns;
+    __u64 layers_finish_ns;
+    __u32 work_cpu;
+    __u32 result_token_id;
+    __s64 result_logit_q16;
 };
 
 struct qwen3_arena_layer_weights {
@@ -71,6 +78,7 @@ struct qwen3_arena_bf16_work {
     __u32 event_next_position;
     __u32 event_layer_count;
     __u32 event_layer;
+    __u32 event_final_logits;
     __u32 attention_past_cursor;
     __u32 event_stage;
     __u32 embedding_vocab;
@@ -84,6 +92,7 @@ struct qwen3_arena_bf16_work {
     __u64 gate_first_bf16;
     __u64 up_first_bf16;
     __u64 down_first_bf16;
+    __u64 final_norm_first_bf16;
     __u64 q_norm_first_bf16;
     __u64 k_norm_first_bf16;
     __u64 norm_sum_sq_q32;

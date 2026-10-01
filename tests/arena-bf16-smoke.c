@@ -1,12 +1,15 @@
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include <bpf/bpf.h>
@@ -730,7 +733,10 @@ static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
                                     const int32_t *first_qkv,
                                     const int32_t *last_hidden,
                                     const int32_t *last_key,
-                                    const int32_t *last_value)
+                                    const int32_t *last_value,
+                                    const int32_t *final_norm,
+                                    uint32_t expected_token,
+                                    int64_t expected_logit)
 {
     struct sockaddr_in dst = {
         .sin_family = AF_INET,
@@ -745,7 +751,8 @@ static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
     struct timespec begin, now;
     unsigned int ifindex = if_nametoindex("lo");
     uint32_t key, differing = 0;
-    int fd = -1, rc = -1;
+    int64_t reply_elapsed_ns = 0;
+    int fd = -1, poll_fd = -1, rc = -1;
 
     if (!ifindex || !layers || layer_count < 2 ||
         layer_count > QWEN3_EVENT_MAX_LAYERS || !first_qkv ||
@@ -756,6 +763,7 @@ static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
                                 &key, &layers[key], BPF_ANY))
             return -1;
     work->event_layer_count = layer_count;
+    work->event_final_logits = final_norm != NULL;
     link = bpf_program__attach_xdp(skel->progs.qwen3_event_xdp, ifindex);
     if (!link || libbpf_get_error(link)) {
         link = NULL;
@@ -783,9 +791,67 @@ static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
         job.requests != expected_requests ||
         job.completed_requests != expected_requests ||
         work->event_layer != layer_count - 1 ||
-        work->event_stage != QWEN3_EVENT_STAGE_DOWN ||
+        work->event_stage != (final_norm ? QWEN3_EVENT_STAGE_LOGITS :
+                             QWEN3_EVENT_STAGE_DOWN) ||
         work->event_next_position != 1)
         goto done;
+    if (final_norm) {
+        if (job.result_token_id != expected_token ||
+            job.result_logit_q16 != expected_logit ||
+            work->best_index != expected_token ||
+            work->best_q16 != expected_logit)
+            goto done;
+        for (uint32_t col = 0; col < QWEN3_ARENA_TOKEN_WIDTH; col++)
+            if (work->input_q16[col] != final_norm[col])
+                goto done;
+        {
+            unsigned char poll[20] = {'Q', '3', 'B', 'R'};
+            unsigned char response[20];
+            struct timeval timeout = {.tv_sec = 2};
+            struct sockaddr_in sender;
+            socklen_t sender_len = sizeof(sender);
+            uint32_t received_token, received_request;
+            uint64_t received_logit = 0;
+            ssize_t received;
+
+            poll[4] = expected_requests >> 24;
+            poll[5] = expected_requests >> 16;
+            poll[6] = expected_requests >> 8;
+            poll[7] = expected_requests;
+            poll_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (poll_fd < 0 ||
+                setsockopt(poll_fd, SOL_SOCKET, SO_RCVTIMEO,
+                           &timeout, sizeof(timeout)) ||
+                sendto(poll_fd, poll, sizeof(poll), 0,
+                       (struct sockaddr *)&dst, sizeof(dst)) != sizeof(poll))
+                goto done;
+            received = recvfrom(poll_fd, response, sizeof(response), 0,
+                                (struct sockaddr *)&sender, &sender_len);
+            if (received != sizeof(response) ||
+                sender.sin_port != htons(49002) ||
+                memcmp(response, "Q3BA", 4)) {
+                fprintf(stderr, "XDP result packet missing: recv=%zd errno=%d\n",
+                        received, errno);
+                goto done;
+            }
+            received_token = ((uint32_t)response[4] << 24) |
+                             ((uint32_t)response[5] << 16) |
+                             ((uint32_t)response[6] << 8) | response[7];
+            for (int i = 0; i < 8; i++)
+                received_logit = (received_logit << 8) | response[8 + i];
+            received_request = ((uint32_t)response[16] << 24) |
+                               ((uint32_t)response[17] << 16) |
+                               ((uint32_t)response[18] << 8) | response[19];
+            if (received_token != expected_token ||
+                (int64_t)received_logit != expected_logit ||
+                received_request != expected_requests)
+                goto done;
+            if (clock_gettime(CLOCK_MONOTONIC, &now))
+                goto done;
+            reply_elapsed_ns = (int64_t)(now.tv_sec - begin.tv_sec) *
+                               1000000000 + now.tv_nsec - begin.tv_nsec;
+        }
+    }
     for (uint32_t head = 0; head < QWEN3_ATTENTION_KV_HEADS; head++) {
         struct qwen3_kv_pair pair[2];
 
@@ -825,8 +891,17 @@ static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
                     col, work->hidden_q16[col], last_hidden[col]);
             goto done;
         }
-    printf("XDP %u-layer arithmetic and per-layer KV isolation passed\n",
-           layer_count);
+    if (final_norm)
+        printf("XDP %u-layer vocabulary argmax and UDP reply passed: token=%u logit=%lld host=%.3f ms layers=%.3f ms vocab=%.3f ms cpu=%u\n",
+               layer_count, job.result_token_id,
+               (long long)job.result_logit_q16,
+               (double)reply_elapsed_ns / 1000000.0,
+               (double)(job.layers_finish_ns - job.start_ns) / 1000000.0,
+               (double)(job.finish_ns - job.layers_finish_ns) / 1000000.0,
+               job.work_cpu);
+    else
+        printf("XDP %u-layer arithmetic and per-layer KV isolation passed\n",
+               layer_count);
     rc = 0;
 done:
     if (rc)
@@ -837,8 +912,11 @@ done:
                 work->event_next_position);
     if (fd >= 0)
         close(fd);
+    if (poll_fd >= 0)
+        close(poll_fd);
     bpf_link__destroy(link);
     work->event_layer_count = 0;
+    work->event_final_logits = 0;
     return rc;
 }
 
@@ -928,6 +1006,47 @@ static int find_layer_weights(struct safetensors_file *file, int layer,
     return 0;
 }
 
+static int reference_final_logits(struct safetensors_file *file,
+                                  const int32_t hidden[1024],
+                                  uint64_t embedding_byte,
+                                  uint64_t *norm_byte,
+                                  int32_t normalized[1024],
+                                  uint32_t *token_id,
+                                  int64_t *best_logit)
+{
+    int32_t norm_q20[1024], q24[1024];
+    uint64_t sum_sq = 0, inv_rms;
+
+    if (find_norm_q20(file, "model.norm.weight", 1024,
+                      norm_byte, norm_q20))
+        return -1;
+    for (int i = 0; i < 1024; i++)
+        sum_sq += (uint64_t)((int64_t)hidden[i] * hidden[i]);
+    inv_rms = (1ULL << 32) / reference_isqrt64(sum_sq / 1024 + 4295);
+    for (int i = 0; i < 1024; i++) {
+        int64_t scaled = ((int64_t)hidden[i] * (int64_t)inv_rms) >> 16;
+
+        normalized[i] = (int32_t)((scaled * norm_q20[i]) >> 20);
+    }
+    *token_id = 0;
+    *best_logit = INT32_MIN;
+    for (uint32_t row = 0; row < QWEN3_EVENT_VOCAB; row++) {
+        int64_t sum = 0;
+
+        if (safetensors_read_bf16_q24_at(file, embedding_byte,
+                (uint64_t)row * 1024, 1024, q24))
+            return -1;
+        for (int col = 0; col < 1024; col++)
+            sum += (int64_t)normalized[col] * q24[col];
+        sum >>= 24;
+        if (sum > *best_logit) {
+            *best_logit = sum;
+            *token_id = row;
+        }
+    }
+    return 0;
+}
+
 static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                          struct qwen3_arena_bf16_work *work,
                          const char *path, int with_attention)
@@ -959,6 +1078,10 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     int32_t next_hidden[QWEN3_ARENA_TOKEN_WIDTH];
     int32_t next_key[QWEN3_ARENA_TOKEN_WIDTH];
     int32_t next_value[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t final_norm_expected[QWEN3_ARENA_TOKEN_WIDTH];
+    uint64_t final_norm_byte = 0;
+    uint32_t final_token_expected = 0;
+    int64_t final_logit_expected = 0;
     int32_t second_norm_q20[QWEN3_ARENA_TOKEN_WIDTH];
     int32_t second_post_norm_q20[QWEN3_ARENA_TOKEN_WIDTH];
     int32_t second_head_norm_q20[2][128];
@@ -1344,6 +1467,12 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
             memcpy(layer_value[layer], next_value,
                    sizeof(layer_value[layer]));
         }
+        if (reference_final_logits(&file,
+                layer_hidden[QWEN3_EVENT_MAX_LAYERS - 1],
+                embedding_byte, &final_norm_byte, final_norm_expected,
+                &final_token_expected, &final_logit_expected))
+            goto done;
+        work->final_norm_first_bf16 = final_norm_byte / 2;
     }
     for (int attempt = 0; attempt < 10; attempt++) {
         struct timespec begin, end;
@@ -1399,7 +1528,21 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                                           event_expected[0],
                                           layer_hidden[count - 1],
                                           layer_key[count - 1],
-                                          layer_value[count - 1]);
+                                          layer_value[count - 1],
+                                          NULL, 0, 0);
+            if (rc)
+                break;
+        }
+    if (!rc && with_attention)
+        for (uint32_t repeat = 0; repeat < 3; repeat++) {
+            rc = run_xdp_layer_transition(skel, work, token_ids[0],
+                                          layers, QWEN3_EVENT_MAX_LAYERS,
+                                          38 + repeat, event_expected[0],
+                                          layer_hidden[27], layer_key[27],
+                                          layer_value[27],
+                                          final_norm_expected,
+                                          final_token_expected,
+                                          final_logit_expected);
             if (rc)
                 break;
         }

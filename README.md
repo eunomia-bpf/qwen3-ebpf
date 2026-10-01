@@ -124,10 +124,13 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   residual addition, post-attention RMSNorm, and the complete first-layer MLP.
   The event workqueue now also schedules all 28 layers using the official
   resident weights and separate per-layer KV slots; each single-token layer
-  prefix matches an independent C fixed-point reference. Final vocabulary
-  projection, argmax, and network response are still absent from this event
-  path. C continues to schedule the separate full-inference CLI and handles
-  text. No end-to-end speedup has been established.
+  prefix matches an independent C fixed-point reference. The event path now
+  also runs final RMSNorm, full-vocabulary projection, and argmax, then returns
+  the token ID and logit through an XDP-transmitted UDP result packet after a
+  client poll. C continues to schedule the separate full-inference CLI and
+  handles text. The matched single-token benchmark is described in
+  [Experiments](docs/experiments.md); multi-token 28-layer quality and
+  production throughput are not established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

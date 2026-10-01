@@ -77,9 +77,15 @@ two-position sequence; non-contiguous positions are rejected. The same test
 uses the complete BF16 model payload preloaded into the arena and checks every
 single-token prefix from two through 28 official-weight layers, including
 per-layer KV isolation and exact final hidden vectors against C references.
-Do not run these XDP tests in a production network namespace. The loader still
-supplies resident weights and reads results; multi-token 28-layer correctness,
-vocabulary argmax, and network response are not established in this event path.
+It then checks final RMSNorm and full-vocabulary argmax against C and receives
+the token ID and Q16 logit through a real XDP-transmitted UDP result packet.
+The request packet uses `Q3BP` followed by big-endian token ID and position.
+Because inference completes asynchronously, the client sends a 20-byte `Q3BR`
+poll with the expected completed-request counter in bytes 4–7; after completion
+XDP returns `Q3BA`, token ID (bytes 4–7), signed Q16 logit (bytes 8–15), and
+counter (bytes 16–19), all big-endian. Do not run these XDP tests in a
+production network namespace. Multi-token 28-layer correctness and concurrent
+session isolation remain unverified.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:
@@ -152,7 +158,7 @@ network or kernel event.
 | `make test-arena-bf16` / `make test-arena-int4` | Optional arena operator checks, with `MODEL=...` for real weights. |
 | `make test-arena-xdp` | Live loopback XDP → BPF workqueue → resident BF16 operator check in the current network namespace. |
 | `make test-arena-xdp-model MODEL=...` | Ten alternating token-ID requests using resident embeddings, first-layer RMSNorm, and Q/K/V projections, checked against C. |
-| `make test-arena-xdp-attention MODEL=...` | Real packet-triggered first-layer two-token check and every official-weight single-token 2–28-layer prefix check. |
+| `make test-arena-xdp-attention MODEL=...` | Real packet-triggered two-token first-layer check, 2–28-layer prefixes, full-vocabulary argmax, and UDP reply. |
 | `make clean` | Remove only generated files under `build/`. |
 
 Output names and CLI arguments are unchanged. Tests live in `tests/`, shared

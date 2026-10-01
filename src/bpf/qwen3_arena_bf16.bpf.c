@@ -310,6 +310,7 @@ static long event_norm_sum(__u32 tile, void *ctx)
 #pragma clang loop unroll(disable)
     for (i = 0; i < 128; i++) {
         __s64 x = (state->event_stage == QWEN3_EVENT_STAGE_O ||
+                    state->event_stage == QWEN3_EVENT_STAGE_FINAL_NORM ||
                     state->event_layer) ?
             state->hidden_q16[bounded_tile * 128 + i] :
             state->embedding_q16[bounded_tile * 128 + i];
@@ -333,9 +334,10 @@ static long event_norm_apply(__u32 tile, void *ctx)
 #pragma clang loop unroll(disable)
     for (i = 0; i < 128; i++) {
         __u32 index = bounded_tile * 128 + i;
-        __u64 first = (state->event_stage == QWEN3_EVENT_STAGE_O ?
-                       state->post_norm_first_bf16 : state->norm_first_bf16) +
-                      index;
+        __u64 first = (state->event_stage == QWEN3_EVENT_STAGE_FINAL_NORM ?
+                       state->final_norm_first_bf16 :
+                       state->event_stage == QWEN3_EVENT_STAGE_O ?
+                       state->post_norm_first_bf16 : state->norm_first_bf16) + index;
         __s64 normalized;
         __u16 bits;
 
@@ -345,6 +347,7 @@ static long event_norm_apply(__u32 tile, void *ctx)
         }
         bits = model_bf16[first];
         normalized = ((__s64)((state->event_stage == QWEN3_EVENT_STAGE_O ||
+                      state->event_stage == QWEN3_EVENT_STAGE_FINAL_NORM ||
                       state->event_layer) ?
                       state->hidden_q16[index] :
                       state->embedding_q16[index]) *
@@ -720,6 +723,7 @@ static int event_callback(void *map, int *key, void *value)
 
     (void)map;
     (void)key;
+    job->work_cpu = bpf_get_smp_processor_id();
     if (!state || !state->rows || state->rows > QWEN3_ARENA_BF16_ROWS ||
         !state->cols || state->cols > QWEN3_ARENA_BF16_COLS) {
         job->status = QWEN3_EVENT_ERROR;
@@ -769,11 +773,13 @@ static int event_callback(void *map, int *key, void *value)
     total = state->matrix_total_rows ? state->matrix_total_rows : state->rows;
     base = state->base_index;
     rows = state->rows;
-    if (total > QWEN3_ARENA_EVENT_OUTPUTS || base >= total ||
+    if (total > (state->event_stage == QWEN3_EVENT_STAGE_LOGITS ?
+                 QWEN3_EVENT_VOCAB : QWEN3_ARENA_EVENT_OUTPUTS) ||
+        base >= total ||
         rows > total - base ||
         (state->event_qkv &&
          (state->event_stage < QWEN3_EVENT_STAGE_Q ||
-          state->event_stage > QWEN3_EVENT_STAGE_DOWN))) {
+          state->event_stage > QWEN3_EVENT_STAGE_LOGITS))) {
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
@@ -824,11 +830,13 @@ static int event_callback(void *map, int *key, void *value)
         job->status = QWEN3_EVENT_ERROR;
         return 0;
     }
-    callback_ctx = 0;
-    bpf_loop(rows, store_output_row, &callback_ctx, 0);
-    if (callback_ctx) {
-        job->status = QWEN3_EVENT_ERROR;
-        return 0;
+    if (state->event_stage != QWEN3_EVENT_STAGE_LOGITS) {
+        callback_ctx = 0;
+        bpf_loop(rows, store_output_row, &callback_ctx, 0);
+        if (callback_ctx) {
+            job->status = QWEN3_EVENT_ERROR;
+            return 0;
+        }
     }
     base += rows;
     if (base == total) {
@@ -986,7 +994,54 @@ static int event_callback(void *map, int *key, void *value)
                     job->status = QWEN3_EVENT_ERROR;
                 return 0;
             }
+            if (state->event_final_logits) {
+                job->layers_finish_ns = bpf_ktime_get_ns();
+                if (state->final_norm_first_bf16 > state->model_elements ||
+                    QWEN3_ARENA_TOKEN_WIDTH >
+                        state->model_elements - state->final_norm_first_bf16 ||
+                    state->embedding_first_bf16 > state->model_elements ||
+                    (__u64)QWEN3_EVENT_VOCAB * QWEN3_ARENA_TOKEN_WIDTH >
+                        state->model_elements - state->embedding_first_bf16) {
+                    job->status = QWEN3_EVENT_ERROR;
+                    return 0;
+                }
+                state->event_stage = QWEN3_EVENT_STAGE_FINAL_NORM;
+                state->norm_sum_sq_q32 = 0;
+                callback_ctx = 0;
+                bpf_loop(8, event_norm_sum, &callback_ctx, 0);
+                if (callback_ctx) {
+                    job->status = QWEN3_EVENT_ERROR;
+                    return 0;
+                }
+                state->norm_inv_rms_q16 =
+                    (1ULL << 32) / event_isqrt64(state->norm_sum_sq_q32 /
+                                                  QWEN3_ARENA_TOKEN_WIDTH + 4295);
+                callback_ctx = 0;
+                bpf_loop(8, event_norm_apply, &callback_ctx, 0);
+                if (callback_ctx) {
+                    job->status = QWEN3_EVENT_ERROR;
+                    return 0;
+                }
+                state->event_stage = QWEN3_EVENT_STAGE_LOGITS;
+                state->weight_first_bf16 = state->embedding_first_bf16;
+                state->matrix_total_rows = QWEN3_EVENT_VOCAB;
+                state->base_index = 0;
+                state->rows = QWEN3_ARENA_BF16_ROWS;
+                state->cols = QWEN3_ARENA_TOKEN_WIDTH;
+                state->track_argmax = 1;
+                state->best_q16 = -2147483648LL;
+                state->best_index = 0;
+                if (bpf_wq_start(&job->work, 0))
+                    job->status = QWEN3_EVENT_ERROR;
+                return 0;
+            }
             state->event_next_position = state->event_position + 1;
+        }
+        if (state->event_stage == QWEN3_EVENT_STAGE_LOGITS) {
+            job->result_token_id = state->best_index;
+            job->result_logit_q16 = state->best_q16;
+            state->event_next_position = state->event_position + 1;
+            state->track_argmax = 0;
         }
         job->finish_ns = bpf_ktime_get_ns();
         job->completed_requests++;
@@ -1042,10 +1097,59 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     payload = (void *)(udp + 1);
     if (payload + 4 > (unsigned char *)end ||
         payload[0] != 'Q' || payload[1] != '3' ||
-        payload[2] != 'B' || payload[3] != 'P')
+        payload[2] != 'B')
         return XDP_PASS;
     state = bpf_map_lookup_elem(&work, &key);
     if (!state)
+        return XDP_PASS;
+    if (payload[3] == 'R') {
+        __u32 request_number;
+        __u32 token;
+        __u64 logit;
+        __be32 address;
+        __be16 port;
+        __u8 mac[ETH_ALEN];
+
+        if (!state->event_final_logits ||
+            payload + 20 > (unsigned char *)end ||
+            bpf_ntohs(udp->len) < sizeof(*udp) + 20 ||
+            bpf_ntohs(ip->tot_len) < sizeof(*ip) + sizeof(*udp) + 20)
+            return XDP_PASS;
+        job = bpf_map_lookup_elem(&event, &key);
+        if (!job || job->status != QWEN3_EVENT_DONE)
+            return XDP_PASS;
+        request_number = ((__u32)payload[4] << 24) |
+                         ((__u32)payload[5] << 16) |
+                         ((__u32)payload[6] << 8) | payload[7];
+        if (request_number != job->completed_requests)
+            return XDP_PASS;
+        token = job->result_token_id;
+        logit = (__u64)job->result_logit_q16;
+        payload[3] = 'A';
+        payload[4] = token >> 24;
+        payload[5] = token >> 16;
+        payload[6] = token >> 8;
+        payload[7] = token;
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; i++)
+            payload[8 + i] = logit >> (56 - 8 * i);
+        payload[16] = request_number >> 24;
+        payload[17] = request_number >> 16;
+        payload[18] = request_number >> 8;
+        payload[19] = request_number;
+        __builtin_memcpy(mac, eth->h_source, ETH_ALEN);
+        __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+        __builtin_memcpy(eth->h_dest, mac, ETH_ALEN);
+        address = ip->saddr;
+        ip->saddr = ip->daddr;
+        ip->daddr = address;
+        port = udp->source;
+        udp->source = udp->dest;
+        udp->dest = port;
+        udp->check = 0;
+        return XDP_TX;
+    }
+    if (payload[3] != 'P')
         return XDP_PASS;
     if (state->event_use_token) {
         if (payload + 8 > (unsigned char *)end)
@@ -1098,6 +1202,7 @@ int qwen3_event_xdp(struct xdp_md *ctx)
     job->requests++;
     job->start_ns = bpf_ktime_get_ns();
     job->finish_ns = 0;
+    job->layers_finish_ns = 0;
     if (bpf_wq_start(&job->work, 0))
         job->status = QWEN3_EVENT_ERROR;
     return XDP_PASS;

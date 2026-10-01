@@ -228,6 +228,19 @@ argmax for these short multi-token sequences through the standalone live XDP
 path; it does not establish long-context quality, full-vocabulary logit
 agreement for every position, concurrent sessions, or generation quality.
 
+An explicit raw-token UDP client then sent `[0, 1, ..., 9]` to the same
+single-session XDP path on Cortex-X925 CPU 5. All ten requests returned;
+the final ID `10` and Q16 logit `1142397` exactly matched the resident CLI
+for the same input. The client observed 7.035 s for the ten replies after
+model loading, while the CLI reported 5.706 s for its complete ten-token
+forward path after loading, also pinned to CPU 5. A separate fresh XDP
+session for the official tokenizer's `Hello, world!` IDs
+`[9707, 11, 1879, 0]` returned ID `1096` and Q16 logit `910709`, matching
+the resident CLI; the client observed 2.369 s versus the CLI's 2.085 s.
+These are single shared-host runs with different client/CLI timing boundaries,
+not a controlled throughput study. They do show that the previously measured
+single-token latency advantage did **not** carry over to these two sequences.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

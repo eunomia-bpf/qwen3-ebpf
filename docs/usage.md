@@ -93,7 +93,10 @@ loader and attach it to a disposable interface:
 
 ```sh
 make build/serve-xdp
+make build/xdp-client
 sudo ./build/serve-xdp /path/to/model.safetensors lo
+# In another shell, against that fresh loader instance:
+./build/xdp-client 127.0.0.1 9707 11 1879 0
 ```
 
 The loader maps the official model, copies its BF16 payload into the BPF arena,
@@ -102,9 +105,12 @@ startup, inference scheduling, weights, KV state, argmax, and UDP result replies
 stay in BPF; the loader only keeps the BPF link alive and detaches it on
 SIGINT/SIGTERM. Send the `Q3BP`/`Q3BR` packets described above to UDP/49002
 on that interface. This is a single-session, raw-token prototype, not a
-general socket service: tokenization, client request construction, concurrent
-sessions, and arbitrary-length generation are not provided by this loader.
-Avoid attaching it to a production interface.
+general socket service: tokenization, concurrent sessions, and
+arbitrary-length generation are not provided by this loader.
+The client sends sequential raw token IDs and polls for each result; it does
+no model computation. Start a fresh loader for each sequence because the
+request counter is global to this single-session prototype. Avoid attaching
+it to a production interface.
 
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:

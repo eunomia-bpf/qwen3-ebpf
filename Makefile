@@ -36,6 +36,7 @@ help:
 	  'make experiments     Build standalone matvec / INT4 / INT8 experiments' \
 	  'make build/infer-arena-bf16      Build optional arena inference' \
 	  'make build/serve-xdp             Build the XDP-only model loader' \
+	  'make build/xdp-client            Build the raw-token UDP test client' \
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
 	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
 	  'make test-arena-xdp-model MODEL=... Run token-driven real-weight XDP matrix check' \
@@ -84,6 +85,9 @@ build/infer-arena-bf16: $(HOST_SOURCES) $(HEADERS) build/qwen3_arena_bf16.skel.h
 
 build/serve-xdp: src/serve_xdp.c src/safetensors.c build/qwen3_arena_bf16.skel.h $(HEADERS) | build
 	$(CC) $(CFLAGS) $(ARENA_INCLUDES) src/serve_xdp.c src/safetensors.c -o $@ $(ARENA_LIBBPF) -lelf -lz -lm
+
+build/xdp-client: tests/xdp-client.c | build
+	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@
 
 test: all $(EXPERIMENT_OBJECTS) $(SMOKE_BINS)
 	./build/safetensors-smoke

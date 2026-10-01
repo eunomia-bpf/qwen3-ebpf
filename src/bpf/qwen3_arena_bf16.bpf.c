@@ -1117,12 +1117,12 @@ int qwen3_event_xdp(struct xdp_md *ctx)
             return XDP_PASS;
         job = bpf_map_lookup_elem(&event, &key);
         if (!job || job->status != QWEN3_EVENT_DONE)
-            return XDP_PASS;
+            return XDP_DROP;
         request_number = ((__u32)payload[4] << 24) |
                          ((__u32)payload[5] << 16) |
                          ((__u32)payload[6] << 8) | payload[7];
         if (request_number != job->completed_requests)
-            return XDP_PASS;
+            return XDP_DROP;
         token = job->result_token_id;
         logit = (__u64)job->result_logit_q16;
         payload[3] = 'A';

@@ -81,7 +81,7 @@ static int request_token(int fd, const struct sockaddr_in *server,
         if (size < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
             errno != ECONNREFUSED && errno != EINTR)
             return -1;
-        usleep(10000);
+        usleep(1000);
     }
     fprintf(stderr, "no XDP result for position %u\n", position);
     return -1;
@@ -93,7 +93,7 @@ int main(int argc, char **argv)
         .sin_family = AF_INET,
         .sin_port = htons(49002),
     };
-    struct timeval timeout = {.tv_usec = 20000};
+    struct timeval timeout = {.tv_usec = 5000};
     uint32_t *tokens;
     uint64_t start;
     int fd, rc = 1;

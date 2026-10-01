@@ -241,6 +241,19 @@ These are single shared-host runs with different client/CLI timing boundaries,
 not a controlled throughput study. They do show that the previously measured
 single-token latency advantage did **not** carry over to these two sequences.
 
+The first client used a 20 ms receive timeout plus 10 ms retry delay. While
+work was running, valid polls passed through XDP to an unbound UDP port,
+which can produce ICMP port-unreachable responses. The event handler was
+changed to drop valid but unready/stale polls. The client retry interval was
+shortened to a 5 ms receive timeout plus 1 ms delay. One pinned ten-token
+observation then took 5.713 s through XDP, with the same final ID/logit.
+An intermediate 20/10 ms poll run after the drop change took 5.855 s.
+Resident CLI observations on the same CPU were 5.706 s and 4.784 s. These
+shared-host single runs have substantial variability and different timing
+boundaries. The changes remove
+unnecessary ICMP traffic and improve the observed client path, but they do
+not establish a sustained speedup over the CLI.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

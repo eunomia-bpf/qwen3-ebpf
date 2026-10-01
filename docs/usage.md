@@ -87,6 +87,24 @@ counter (bytes 16–19), all big-endian. Do not run these XDP tests in a
 production network namespace. Multi-token 28-layer correctness and concurrent
 session isolation remain unverified.
 
+To run that event path without the smoke-test driver, build the standalone
+loader and attach it to a disposable interface:
+
+```sh
+make build/serve-xdp
+sudo ./build/serve-xdp /path/to/model.safetensors lo
+```
+
+The loader maps the official model, copies its BF16 payload into the BPF arena,
+sets the 28 layer offsets, initializes the workqueue, and attaches XDP. After
+startup, inference scheduling, weights, KV state, argmax, and UDP result replies
+stay in BPF; the loader only keeps the BPF link alive and detaches it on
+SIGINT/SIGTERM. Send the `Q3BP`/`Q3BR` packets described above to UDP/49002
+on that interface. This is a single-session, raw-token prototype, not a
+general socket service: tokenization, client request construction, concurrent
+sessions, and arbitrary-length generation are not provided by this loader.
+Avoid attaching it to a production interface.
+
 To test against an actual Qwen3-0.6B tensor, obtain the official
 `model.safetensors` separately and run:
 

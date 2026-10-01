@@ -35,6 +35,7 @@ help:
 	  'make test-tokenizer TOKENIZER=... Run tokenizer checks (no BPF privileges)' \
 	  'make experiments     Build standalone matvec / INT4 / INT8 experiments' \
 	  'make build/infer-arena-bf16      Build optional arena inference' \
+	  'make build/serve-xdp             Build the XDP-only model loader' \
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
 	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
 	  'make test-arena-xdp-model MODEL=... Run token-driven real-weight XDP matrix check' \
@@ -80,6 +81,9 @@ build/arena-int4-smoke build/arena-bf16-smoke: build/arena-%-smoke: tests/arena-
 
 build/infer-arena-bf16: $(HOST_SOURCES) $(HEADERS) build/qwen3_arena_bf16.skel.h $(BPF_OBJECTS) | build
 	$(CC) $(CFLAGS) -DQWEN3_USE_ARENA_BF16 $(ARENA_INCLUDES) $(HOST_SOURCES) -o $@ $(ARENA_LIBBPF) -lelf -lz -lm -ljson-c -lonig
+
+build/serve-xdp: src/serve_xdp.c src/safetensors.c build/qwen3_arena_bf16.skel.h $(HEADERS) | build
+	$(CC) $(CFLAGS) $(ARENA_INCLUDES) src/serve_xdp.c src/safetensors.c -o $@ $(ARENA_LIBBPF) -lelf -lz -lm
 
 test: all $(EXPERIMENT_OBJECTS) $(SMOKE_BINS)
 	./build/safetensors-smoke

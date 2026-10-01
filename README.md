@@ -127,8 +127,9 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   prefix matches an independent C fixed-point reference. The event path now
   also runs final RMSNorm, full-vocabulary projection, and argmax, then returns
   the token ID and logit through an XDP-transmitted UDP result packet after a
-  client poll. C continues to schedule the separate full-inference CLI and
-  handles text. The matched single-token benchmark is described in
+  client poll. An optional standalone loader now installs that XDP path and
+  leaves model execution in BPF; the separate full-inference CLI still uses C
+  for scheduling and text. The matched single-token benchmark is described in
   [Experiments](docs/experiments.md); multi-token 28-layer quality and
   production throughput are not established.
 - Verifier portability, broader numerical validation, and throughput remain

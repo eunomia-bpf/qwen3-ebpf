@@ -86,8 +86,8 @@ build/infer-arena-bf16: $(HOST_SOURCES) $(HEADERS) build/qwen3_arena_bf16.skel.h
 build/serve-xdp: src/serve_xdp.c src/safetensors.c build/qwen3_arena_bf16.skel.h $(HEADERS) | build
 	$(CC) $(CFLAGS) $(ARENA_INCLUDES) src/serve_xdp.c src/safetensors.c -o $@ $(ARENA_LIBBPF) -lelf -lz -lm
 
-build/xdp-client: tests/xdp-client.c | build
-	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@
+build/xdp-client: tests/xdp-client.c src/qwen3_tokenizer.c include/qwen3_tokenizer.h | build
+	$(CC) $(CFLAGS) $(INCLUDES) $(filter %.c,$^) -o $@ -ljson-c -lonig
 
 test: all $(EXPERIMENT_OBJECTS) $(SMOKE_BINS)
 	./build/safetensors-smoke

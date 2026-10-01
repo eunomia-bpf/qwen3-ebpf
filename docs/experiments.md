@@ -254,6 +254,24 @@ boundaries. The changes remove
 unnecessary ICMP traffic and improve the observed client path, but they do
 not establish a sustained speedup over the CLI.
 
+A 131-token technical prose fixture in `tests/long-context.txt` exercised
+the live XDP path with the official tokenizer and model. Against the resident
+CLI's per-prefix fixed-point argmax, the first 130 XDP replies selected the
+same token IDs at every position. Their Q16 best logits matched exactly
+through position 35, then differed at 93 of the 130 positions; the largest
+absolute difference was 329 Q16 units (about 0.0050) and the mean absolute
+difference across all 130 positions was 30.09 units (about 0.00046). The
+final position selected ID `576` in both paths, with Q16 best logits
+`1060767` (XDP) and `1060769` (CLI). The kernel integer RoPE cosine at
+position 36, frequency index 6, differs by one Q20 unit from the CLI's
+libm-based coefficient; that coincides with the first logit divergence but
+does not alone prove the cause of every later difference. On pinned
+Cortex-X925 CPU 5, packet-to-reply for the 131-token sequence took 76.715 s,
+versus 57.631 s for the resident CLI forward path after model loading.
+These single runs do not show a long-context performance benefit, and
+argmax agreement with a fixed-point CLI is not a full language-quality
+evaluation against BF16 reference logits.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

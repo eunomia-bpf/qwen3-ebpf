@@ -9,8 +9,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include "qwen3_tokenizer.h"
 
 #define QWEN3_0_6B_VOCAB 151936UL
+#define XDP_CLIENT_MAX_TOKENS 256
 
 static uint64_t monotonic_ns(void)
 {
@@ -94,28 +96,50 @@ int main(int argc, char **argv)
         .sin_port = htons(49002),
     };
     struct timeval timeout = {.tv_usec = 5000};
-    uint32_t *tokens;
+    struct qwen3_tokenizer *tokenizer = NULL;
+    uint32_t *tokens = NULL;
+    size_t count = 0;
     uint64_t start;
     int fd, rc = 1;
 
     if (argc < 3 || inet_pton(AF_INET, argv[1], &server.sin_addr) != 1) {
-        fprintf(stderr, "usage: %s IPv4 token_id [token_id ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s IPv4 token_id [token_id ...]\n"
+                        "   or: %s IPv4 --tokenizer tokenizer.json --prompt text\n",
+                argv[0], argv[0]);
         return 2;
     }
-    tokens = calloc((size_t)argc - 2, sizeof(*tokens));
-    if (!tokens)
-        return 1;
-    for (int i = 2; i < argc; i++) {
-        char *end;
-        unsigned long value;
-
-        errno = 0;
-        value = strtoul(argv[i], &end, 10);
-        if (errno || !argv[i][0] || *end || value >= QWEN3_0_6B_VOCAB) {
-            fprintf(stderr, "invalid token ID: %s\n", argv[i]);
+    if (argc == 6 && !strcmp(argv[2], "--tokenizer") &&
+        !strcmp(argv[4], "--prompt")) {
+        tokenizer = qwen3_tokenizer_open(argv[3]);
+        if (!tokenizer ||
+            qwen3_tokenizer_encode(tokenizer, argv[5], &tokens, &count) ||
+            !count || count > XDP_CLIENT_MAX_TOKENS) {
+            fprintf(stderr, "could not encode prompt within XDP KV limit\n");
             goto done;
         }
-        tokens[i - 2] = (uint32_t)value;
+        fprintf(stderr, "input_tokens=%zu\n", count);
+    } else {
+        count = (size_t)argc - 2;
+        if (count > XDP_CLIENT_MAX_TOKENS) {
+            fprintf(stderr, "too many token IDs for XDP KV cache\n");
+            goto done;
+        }
+        tokens = calloc(count, sizeof(*tokens));
+        if (!tokens)
+            goto done;
+        for (size_t i = 0; i < count; i++) {
+            char *end;
+            unsigned long value;
+
+            errno = 0;
+            value = strtoul(argv[i + 2], &end, 10);
+            if (errno || !argv[i + 2][0] || *end ||
+                value >= QWEN3_0_6B_VOCAB) {
+                fprintf(stderr, "invalid token ID: %s\n", argv[i + 2]);
+                goto done;
+            }
+            tokens[i] = (uint32_t)value;
+        }
     }
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
@@ -125,15 +149,16 @@ int main(int argc, char **argv)
         goto done;
     }
     start = monotonic_ns();
-    for (int i = 2; i < argc; i++)
-        if (request_token(fd, &server, tokens[i - 2], (uint32_t)(i - 2)))
+    for (size_t i = 0; i < count; i++)
+        if (request_token(fd, &server, tokens[i], (uint32_t)i))
             goto close_socket;
-    printf("tokens=%d total_ms=%.3f\n", argc - 2,
+    printf("tokens=%zu total_ms=%.3f\n", count,
            (monotonic_ns() - start) / 1000000.0);
     rc = 0;
 close_socket:
     close(fd);
 done:
     free(tokens);
+    qwen3_tokenizer_close(tokenizer);
     return rc;
 }

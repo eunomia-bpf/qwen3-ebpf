@@ -98,6 +98,8 @@ make build/xdp-client
 sudo ./build/serve-xdp /path/to/model.safetensors lo
 # In another shell, against that fresh loader instance:
 ./build/xdp-client 127.0.0.1 9707 11 1879 0
+./build/xdp-client 127.0.0.1 --tokenizer /path/to/tokenizer.json \
+  --prompt "Hello, world!"
 ```
 
 The loader maps the official model, copies its BF16 payload into the BPF arena,
@@ -108,8 +110,9 @@ SIGINT/SIGTERM. Send the `Q3BP`/`Q3BR` packets described above to UDP/49002
 on that interface. This is a single-session, raw-token prototype, not a
 general socket service: tokenization, concurrent sessions, and
 arbitrary-length generation are not provided by this loader.
-The client sends sequential raw token IDs and polls for each result; it does
-no model computation. Start a fresh loader for each sequence because the
+The client sends sequential token IDs and polls for each result. Its optional
+text mode uses the existing user-space tokenizer but does no model computation.
+Start a fresh loader for each sequence because the
 request counter is global to this single-session prototype. Avoid attaching
 it to a production interface.
 

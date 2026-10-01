@@ -131,11 +131,14 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   model execution in BPF. Context-only packets can update all layers and KV
   without a vocabulary projection before the final result-producing packet.
   The separate full-inference CLI still uses C for scheduling and text. The
-  matched single-token benchmark is described in
+  single-token comparison against that BPF-operator CLI is described in
   [Experiments](docs/experiments.md). Short two- and four-token XDP sequences
-  match the resident CLI's final result; a 131-token text input kept the same
-  final token with a small Q16 logit difference. Broader multi-token quality
-  and production throughput are not established.
+  match the resident CLI's final result. On exact 125- and 131-token inputs,
+  XDP and official BF16 agreed on the final token; 251 of 256 online
+  per-prefix argmax IDs matched exactly, and four of the five differences were
+  BF16 top-score ties. No speed benefit over the official user-space BF16 CPU
+  baseline has been demonstrated. Broader model quality and production
+  throughput remain unestablished.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

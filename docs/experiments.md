@@ -314,6 +314,50 @@ final argmax and top logits and can print all input IDs for exact replay.
 The text-mode XDP replay used `xargs -0` with input redirected from the file,
 which preserved the final LF instead of stripping it in shell substitution.
 
+For the same 131 exact IDs, XDP also projected the full vocabulary at every
+position in two live packet runs. All 131 token/logit replies were identical
+between runs. Against one batched official BF16 forward pass, its argmax
+matched at 129 of 131 positions. At position 70, the two selected IDs tied
+at BF16 logit `16.375`; at position 92, BF16 selected `4362` at `15.875`
+while XDP selected BF16 runner-up `3601` at `15.750`. The resident fixed-point
+CLI also selected `3601` at position 92, so this discrepancy was not specific
+to XDP event scheduling.
+
+The reference script's `--incremental` mode processed one token at a time
+with the official BF16 model's KV cache and computed vocabulary logits at
+every position, matching XDP's online workload more closely than a batched
+teacher-forced pass. Here XDP matched 128 of 131 BF16 argmax IDs. Positions
+11 and 99 had equal BF16 top logits for the two selected IDs; at position 70,
+BF16 selected `1584` at `16.375` while XDP selected BF16 runner-up `7709` at
+`16.250`. The resident fixed-point CLI also selected `7709` at that prefix.
+These checks expose small, ranking-relevant numerical differences and are not
+a general accuracy guarantee or a full-corpus perplexity evaluation.
+
+With the XDP loader and client pinned to Cortex-X925 CPU 5, the two 131-token
+full-projection packet runs took `93.170` and `88.794` seconds from first send
+to final reply, after model loading. Two completed one-core official BF16
+incremental runs on CPU 5 took `26.924` and `19.240` seconds after loading;
+they also computed a cross-entropy score. Shared-host load and BPF workqueue
+CPU placement were not fully controlled, so these are exploratory timings,
+but they show no speed benefit over this conventional user-space online
+inference baseline. The previously measured one-token XDP latency advantage
+was relative to the separate BPF-operator CLI, not to optimized BF16 CPU
+inference.
+
+A second exact-input check used the previously recorded public WikiText-2
+row-1011 excerpt, SHA-256
+`b53e6aa42d41d932cae2a7e62422c24c59d52e5682709634d3a5cfbf948479b4`.
+It encoded to 125 input IDs. XDP and online BF16 both selected final token
+`1519`; their per-prefix argmax IDs agreed at 123 of 125 positions. At the
+other two positions, 90 and 108, the selected alternatives had equal BF16
+top logits (`19.75` in both cases). The live XDP request took `85.207` seconds;
+two one-core online BF16 runs took `46.173` and `43.918` seconds after model
+loading. Across these two texts and 256 checked prefixes, 251 argmax IDs
+matched exactly, four of the five differences were BF16 top-score ties, and
+one differed by `0.125` BF16 logit. This is stronger evidence for the live
+event path than isolated short prompts, but it is still only two excerpts and
+does not support a general quality or speedup claim.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

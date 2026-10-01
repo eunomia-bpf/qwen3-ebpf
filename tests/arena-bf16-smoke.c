@@ -179,7 +179,7 @@ static int run_xdp_event(struct qwen3_arena_bf16_bpf *skel,
     unsigned char payload[12] = {'Q', '3', 'B', 'P'};
     const char ignored[] = "Q3XX";
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
-    struct qwen3_event_state job;
+    struct qwen3_event_state job = {0};
     struct bpf_link *link = NULL;
     struct sockaddr_in dst = {
         .sin_family = AF_INET,
@@ -579,17 +579,370 @@ static int32_t reference_silu_q16(int32_t x)
     return (int32_t)(((int64_t)x * (int64_t)sigmoid) >> 16);
 }
 
+static int reference_one_token_layer(struct safetensors_file *file,
+                                  const uint64_t projection_byte[3],
+                                  const int32_t norm_q20[1024],
+                                  const int32_t head_norm_q20[2][128],
+                                  uint64_t o_byte,
+                                  const int32_t post_norm_q20[1024],
+                                  const uint64_t mlp_byte[3],
+                                  const int32_t first_hidden[1024],
+                                  int32_t second_hidden[1024],
+                                  int32_t second_key[1024],
+                                  int32_t second_value[1024])
+{
+    const int rows[3] = {2048, 1024, 1024};
+    const int offsets[3] = {0, 2048, 3072};
+    int32_t input[1024], qkv[4096], attention[2048], intermediate[3072];
+    int32_t projected[2][3072], q24[3072];
+    uint64_t sum_sq = 0, inv_rms;
+
+    for (int i = 0; i < 1024; i++)
+        sum_sq += (uint64_t)((int64_t)first_hidden[i] * first_hidden[i]);
+    inv_rms = (1ULL << 32) /
+        reference_isqrt64(sum_sq / QWEN3_ARENA_TOKEN_WIDTH + 4295);
+    for (int i = 0; i < 1024; i++) {
+        int64_t scaled = ((int64_t)first_hidden[i] * (int64_t)inv_rms) >> 16;
+
+        input[i] = (int32_t)((scaled * norm_q20[i]) >> 20);
+    }
+    for (int projection = 0; projection < 3; projection++)
+        for (int row = 0; row < rows[projection]; row++) {
+            int64_t sum = 0;
+
+            if (safetensors_read_bf16_q24_at(file, projection_byte[projection],
+                    (uint64_t)row * 1024, 1024, q24)) {
+                fprintf(stderr, "second-layer projection read failed: %d/%d\n",
+                        projection, row);
+                return -1;
+            }
+            for (int col = 0; col < 1024; col++)
+                sum += (int64_t)input[col] * q24[col];
+            sum >>= 24;
+            if (sum > INT32_MAX || sum < INT32_MIN) {
+                fprintf(stderr, "second-layer projection overflow: %d/%d\n",
+                        projection, row);
+                return -1;
+            }
+            qkv[offsets[projection] + row] = (int32_t)sum;
+        }
+    for (int head = 0; head < 24; head++) {
+        int set = head >= 16;
+        int base = set ? 2048 + (head - 16) * 128 : head * 128;
+
+        sum_sq = 0;
+        for (int col = 0; col < 128; col++)
+            sum_sq += (uint64_t)((int64_t)qkv[base + col] * qkv[base + col]);
+        inv_rms = (1ULL << 32) / reference_isqrt64(sum_sq / 128 + 4295);
+        for (int col = 0; col < 128; col++) {
+            int64_t scaled = ((int64_t)qkv[base + col] *
+                              (int64_t)inv_rms) >> 16;
+
+            qkv[base + col] =
+                (int32_t)((scaled * head_norm_q20[set][col]) >> 20);
+        }
+    }
+    /* At position zero RoPE is the identity and causal attention has one KV. */
+    memcpy(second_key, qkv + 2048, 1024 * sizeof(*second_key));
+    memcpy(second_value, qkv + 3072, 1024 * sizeof(*second_value));
+    for (int head = 0; head < 16; head++)
+        for (int col = 0; col < 128; col++)
+            attention[head * 128 + col] =
+                second_value[(head / 2) * 128 + col];
+    for (int row = 0; row < 1024; row++) {
+        int64_t sum = 0;
+
+        if (safetensors_read_bf16_q24_at(file, o_byte,
+                (uint64_t)row * 2048, 2048, q24)) {
+            fprintf(stderr, "second-layer output read failed: %d\n", row);
+            return -1;
+        }
+        for (int col = 0; col < 2048; col++)
+            sum += (int64_t)attention[col] * q24[col];
+        sum >>= 24;
+        sum += first_hidden[row];
+        if (sum > INT32_MAX || sum < INT32_MIN) {
+            fprintf(stderr, "second-layer output overflow: %d\n", row);
+            return -1;
+        }
+        second_hidden[row] = (int32_t)sum;
+    }
+    sum_sq = 0;
+    for (int i = 0; i < 1024; i++)
+        sum_sq += (uint64_t)((int64_t)second_hidden[i] * second_hidden[i]);
+    inv_rms = (1ULL << 32) /
+        reference_isqrt64(sum_sq / QWEN3_ARENA_TOKEN_WIDTH + 4295);
+    for (int i = 0; i < 1024; i++) {
+        int64_t scaled = ((int64_t)second_hidden[i] *
+                          (int64_t)inv_rms) >> 16;
+
+        input[i] = (int32_t)((scaled * post_norm_q20[i]) >> 20);
+    }
+    for (int set = 0; set < 2; set++)
+        for (int row = 0; row < 3072; row++) {
+            int64_t sum = 0;
+
+            if (safetensors_read_bf16_q24_at(file, mlp_byte[set],
+                    (uint64_t)row * 1024, 1024, q24)) {
+                fprintf(stderr, "second-layer MLP read failed: %d/%d\n",
+                        set, row);
+                return -1;
+            }
+            for (int col = 0; col < 1024; col++)
+                sum += (int64_t)input[col] * q24[col];
+            sum >>= 24;
+            if (sum > INT32_MAX || sum < INT32_MIN) {
+                fprintf(stderr, "second-layer MLP overflow: %d/%d\n",
+                        set, row);
+                return -1;
+            }
+            projected[set][row] = (int32_t)sum;
+        }
+    for (int i = 0; i < 3072; i++)
+        intermediate[i] = (int32_t)(((int64_t)reference_silu_q16(
+            projected[0][i]) * projected[1][i]) >> 16);
+    for (int row = 0; row < 1024; row++) {
+        int64_t sum = 0;
+
+        if (safetensors_read_bf16_q24_at(file, mlp_byte[2],
+                (uint64_t)row * 3072, 3072, q24)) {
+            fprintf(stderr, "second-layer down read failed: %d\n", row);
+            return -1;
+        }
+        for (int col = 0; col < 3072; col++)
+            sum += (int64_t)intermediate[col] * q24[col];
+        sum = (sum >> 24) + second_hidden[row];
+        if (sum > INT32_MAX || sum < INT32_MIN) {
+            fprintf(stderr, "second-layer down overflow: %d\n", row);
+            return -1;
+        }
+        second_hidden[row] = (int32_t)sum;
+    }
+    return 0;
+}
+
+static int run_xdp_layer_transition(struct qwen3_arena_bf16_bpf *skel,
+                                    struct qwen3_arena_bf16_work *work,
+                                    uint32_t token_id,
+                                    const struct qwen3_arena_layer_weights *layers,
+                                    uint32_t layer_count,
+                                    uint32_t expected_requests,
+                                    const int32_t *first_qkv,
+                                    const int32_t *last_hidden,
+                                    const int32_t *last_key,
+                                    const int32_t *last_value)
+{
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons(49002),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    struct qwen3_event_state job = {0};
+    struct bpf_link *link = NULL;
+    unsigned char payload[12] = {'Q', '3', 'B', 'P',
+        (unsigned char)(token_id >> 24), (unsigned char)(token_id >> 16),
+        (unsigned char)(token_id >> 8), (unsigned char)token_id};
+    struct timespec begin, now;
+    unsigned int ifindex = if_nametoindex("lo");
+    uint32_t key, differing = 0;
+    int fd = -1, rc = -1;
+
+    if (!ifindex || !layers || layer_count < 2 ||
+        layer_count > QWEN3_EVENT_MAX_LAYERS || !first_qkv ||
+        !last_hidden || !last_key || !last_value)
+        return -1;
+    for (key = 0; key < layer_count; key++)
+        if (bpf_map_update_elem(bpf_map__fd(skel->maps.event_layer_weights),
+                                &key, &layers[key], BPF_ANY))
+            return -1;
+    work->event_layer_count = layer_count;
+    link = bpf_program__attach_xdp(skel->progs.qwen3_event_xdp, ifindex);
+    if (!link || libbpf_get_error(link)) {
+        link = NULL;
+        goto done;
+    }
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0 || clock_gettime(CLOCK_MONOTONIC, &begin) ||
+        sendto(fd, payload, sizeof(payload), 0,
+               (struct sockaddr *)&dst, sizeof(dst)) != sizeof(payload))
+        goto done;
+    do {
+        key = 0;
+        if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event), &key, &job) ||
+            job.status == QWEN3_EVENT_ERROR)
+            goto done;
+        if (job.status == QWEN3_EVENT_DONE &&
+            job.completed_requests == expected_requests)
+            break;
+        usleep(100);
+        if (clock_gettime(CLOCK_MONOTONIC, &now))
+            goto done;
+    } while ((__s64)(now.tv_sec - begin.tv_sec) * 1000000000 +
+             now.tv_nsec - begin.tv_nsec < 30000000000LL);
+    if (job.status != QWEN3_EVENT_DONE ||
+        job.requests != expected_requests ||
+        job.completed_requests != expected_requests ||
+        work->event_layer != layer_count - 1 ||
+        work->event_stage != QWEN3_EVENT_STAGE_DOWN ||
+        work->event_next_position != 1)
+        goto done;
+    for (uint32_t head = 0; head < QWEN3_ATTENTION_KV_HEADS; head++) {
+        struct qwen3_kv_pair pair[2];
+
+        for (uint32_t layer = 0; layer < 2; layer++) {
+            key = (layer ? layer_count - 1 : 0) *
+                  QWEN3_EVENT_KV_LIMIT * QWEN3_ATTENTION_KV_HEADS + head;
+            if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.event_kv),
+                                    &key, &pair[layer]))
+                goto done;
+        }
+        for (uint32_t col = 0; col < 128; col++) {
+            uint32_t index = head * 128 + col;
+
+            if (pair[0].key_q16[col] != first_qkv[2048 + index] ||
+                pair[0].value_q16[col] != first_qkv[3072 + index] ||
+                pair[1].key_q16[col] != last_key[index] ||
+                pair[1].value_q16[col] != last_value[index] ||
+                pair[1].key_q16[col] != work->key_q16[index] ||
+                pair[1].value_q16[col] != work->value_q16[index]) {
+                fprintf(stderr, "XDP layer KV mismatch head=%u col=%u first K=%d/%d V=%d/%d last K=%d/%d V=%d/%d\n",
+                        head, col, pair[0].key_q16[col],
+                        first_qkv[2048 + index], pair[0].value_q16[col],
+                        first_qkv[3072 + index], pair[1].key_q16[col],
+                        last_key[index], pair[1].value_q16[col],
+                        last_value[index]);
+                goto done;
+            }
+            differing |= pair[0].key_q16[col] != pair[1].key_q16[col] ||
+                         pair[0].value_q16[col] != pair[1].value_q16[col];
+        }
+    }
+    if (!differing)
+        goto done;
+    for (uint32_t col = 0; col < QWEN3_ARENA_TOKEN_WIDTH; col++)
+        if (work->hidden_q16[col] != last_hidden[col]) {
+            fprintf(stderr, "XDP layer hidden mismatch col=%u BPF=%d C=%d\n",
+                    col, work->hidden_q16[col], last_hidden[col]);
+            goto done;
+        }
+    printf("XDP %u-layer arithmetic and per-layer KV isolation passed\n",
+           layer_count);
+    rc = 0;
+done:
+    if (rc)
+        fprintf(stderr, "XDP %u-layer transition failed: status=%llu requests=%u completions=%u layer=%u stage=%u base=%u next=%u\n",
+                layer_count, (unsigned long long)job.status, job.requests,
+                job.completed_requests, work->event_layer,
+                work->event_stage, work->base_index,
+                work->event_next_position);
+    if (fd >= 0)
+        close(fd);
+    bpf_link__destroy(link);
+    work->event_layer_count = 0;
+    return rc;
+}
+
+static int find_matrix_offset(struct safetensors_file *file, const char *name,
+                              uint64_t elements, uint64_t *byte)
+{
+    uint64_t found;
+
+    return safetensors_find_bf16(file, name, byte, &found) ||
+           found != elements ? -1 : 0;
+}
+
+static int find_norm_q20(struct safetensors_file *file, const char *name,
+                         uint32_t count, uint64_t *byte, int32_t *out)
+{
+    float values[QWEN3_ARENA_TOKEN_WIDTH];
+
+    if (count > QWEN3_ARENA_TOKEN_WIDTH ||
+        find_matrix_offset(file, name, count, byte) ||
+        safetensors_read_bf16_at(file, *byte, 0, count, values))
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        double scaled = (double)values[i] * 1048576.0;
+
+        if (!isfinite(scaled) || scaled > INT32_MAX || scaled < INT32_MIN)
+            return -1;
+        out[i] = (int32_t)(scaled + (scaled >= 0 ? 0.5 : -0.5));
+    }
+    return 0;
+}
+
+static int find_layer_weights(struct safetensors_file *file, int layer,
+                              struct qwen3_arena_layer_weights *weights,
+                              uint64_t projection_byte[3],
+                              int32_t norm_q20[1024],
+                              int32_t head_norm_q20[2][128],
+                              uint64_t *o_byte,
+                              int32_t post_norm_q20[1024],
+                              uint64_t mlp_byte[3])
+{
+    char name[96];
+    uint64_t byte;
+    const char *projection[3] = {"q_proj", "k_proj", "v_proj"};
+    const char *mlp[3] = {"gate_proj", "up_proj", "down_proj"};
+
+    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
+    if (find_norm_q20(file, name, 1024, &byte, norm_q20))
+        return -1;
+    weights->input_norm_first_bf16 = byte / 2;
+    snprintf(name, sizeof(name),
+             "model.layers.%d.post_attention_layernorm.weight", layer);
+    if (find_norm_q20(file, name, 1024, &byte, post_norm_q20))
+        return -1;
+    weights->post_norm_first_bf16 = byte / 2;
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer);
+    if (find_norm_q20(file, name, 128, &byte, head_norm_q20[0]))
+        return -1;
+    weights->q_norm_first_bf16 = byte / 2;
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer);
+    if (find_norm_q20(file, name, 128, &byte, head_norm_q20[1]))
+        return -1;
+    weights->k_norm_first_bf16 = byte / 2;
+    for (int i = 0; i < 3; i++) {
+        uint64_t elements = (uint64_t)(i ? 1024 : 2048) * 1024;
+
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.%s.weight",
+                 layer, projection[i]);
+        if (find_matrix_offset(file, name, elements, &projection_byte[i]))
+            return -1;
+    }
+    weights->q_first_bf16 = projection_byte[0] / 2;
+    weights->k_first_bf16 = projection_byte[1] / 2;
+    weights->v_first_bf16 = projection_byte[2] / 2;
+    snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
+    if (find_matrix_offset(file, name, 1024ULL * 2048, o_byte))
+        return -1;
+    weights->o_first_bf16 = *o_byte / 2;
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.%s.weight",
+                 layer, mlp[i]);
+        if (find_matrix_offset(file, name, 3072ULL * 1024, &mlp_byte[i]))
+            return -1;
+    }
+    weights->gate_first_bf16 = mlp_byte[0] / 2;
+    weights->up_first_bf16 = mlp_byte[1] / 2;
+    weights->down_first_bf16 = mlp_byte[2] / 2;
+    return 0;
+}
+
 static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                          struct qwen3_arena_bf16_work *work,
                          const char *path, int with_attention)
 {
     struct safetensors_file file;
     struct bpf_test_run_opts opts = {.sz = sizeof(opts)};
+    struct qwen3_arena_layer_weights layers[QWEN3_EVENT_MAX_LAYERS] = {0};
+    int32_t (*layer_hidden)[QWEN3_ARENA_TOKEN_WIDTH] = NULL;
+    int32_t (*layer_key)[QWEN3_ARENA_TOKEN_WIDTH] = NULL;
+    int32_t (*layer_value)[QWEN3_ARENA_TOKEN_WIDTH] = NULL;
     uint64_t projection_byte[3], projection_elements[3], projection_first[3];
     uint64_t embedding_byte, embedding_elements, cursor;
     uint64_t norm_byte, norm_elements, norm_first;
-    uint64_t o_byte, o_elements, o_first;
-    uint64_t post_norm_byte, post_norm_elements, post_norm_first;
+    uint64_t o_byte, o_elements;
+    uint64_t post_norm_byte, post_norm_elements;
     uint64_t mlp_byte[3], mlp_elements[3], mlp_first[3];
     uint64_t head_norm_byte[2], head_norm_first[2], head_norm_elements[2];
     int32_t q24[1024], hidden[2][1024], normalized[2][1024];
@@ -602,12 +955,20 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     int32_t product_expected[2][QWEN3_ARENA_EVENT_OUTPUTS];
     int32_t down_expected[2][QWEN3_ARENA_TOKEN_WIDTH];
     int32_t final_hidden_expected[2][QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t running_hidden[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t next_hidden[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t next_key[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t next_value[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t second_norm_q20[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t second_post_norm_q20[QWEN3_ARENA_TOKEN_WIDTH];
+    int32_t second_head_norm_q20[2][128];
+    uint64_t second_projection_byte[3], second_mlp_byte[3], second_o_byte;
     int32_t o_q24[QWEN3_ARENA_EVENT_OUTPUTS];
     int32_t rope_cosine[4][64], rope_sine[4][64];
     int32_t direct_outputs[4096];
     float embedding[1024], norm_weights[1024], post_norm_weights[1024];
     float head_norm_weights[2][128];
-    const uint8_t *embedding_raw, *norm_raw, *post_norm_raw = NULL;
+    const uint8_t *embedding_raw, *norm_raw;
     const uint32_t token_ids[2] = {0, 151935};
     const char *projection_names[3] = {
         "model.layers.0.self_attn.q_proj.weight",
@@ -672,69 +1033,67 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                 goto done;
     embedding_raw = file.mapping + 8 + file.header_length + embedding_byte;
     norm_raw = file.mapping + 8 + file.header_length + norm_byte;
-    if (with_attention)
-        post_norm_raw = file.mapping + 8 + file.header_length + post_norm_byte;
     memset(work, 0, sizeof(*work));
-    work->model_elements = embedding_elements + norm_elements;
-    for (projection = 0; projection < 3; projection++)
-        work->model_elements += projection_elements[projection];
-    work->model_elements += head_norm_elements[0] + head_norm_elements[1];
-    if (with_attention)
-        work->model_elements += o_elements + post_norm_elements +
-            mlp_elements[0] + mlp_elements[1] + mlp_elements[2];
+    if (with_attention) {
+        uint64_t data_bytes = file.mapping_size - 8 - file.header_length;
+
+        if ((data_bytes & 1) ||
+            data_bytes / 2 > QWEN3_ARENA_MODEL_MAX_BF16)
+            goto done;
+        work->model_elements = data_bytes / 2;
+    } else {
+        work->model_elements = embedding_elements + norm_elements;
+        for (projection = 0; projection < 3; projection++)
+            work->model_elements += projection_elements[projection];
+        work->model_elements += head_norm_elements[0] + head_norm_elements[1];
+    }
     if (bpf_prog_test_run_opts(
             bpf_program__fd(skel->progs.qwen3_arena_allocate_model),
             &opts) || opts.retval || !skel->bss->model_bf16) {
         fprintf(stderr, "XDP model arena allocation failed\n");
         goto done;
     }
-    memcpy(skel->bss->model_bf16, embedding_raw, embedding_elements * 2);
-    cursor = embedding_elements;
-    for (projection = 0; projection < 3; projection++) {
-        const uint8_t *raw = file.mapping + 8 + file.header_length +
-                             projection_byte[projection];
-
-        projection_first[projection] = cursor;
-        memcpy(skel->bss->model_bf16 + cursor, raw,
-               projection_elements[projection] * 2);
-        cursor += projection_elements[projection];
-    }
-    norm_first = cursor;
-    memcpy(skel->bss->model_bf16 + cursor, norm_raw, norm_elements * 2);
-    cursor += norm_elements;
-    for (int set = 0; set < 2; set++) {
-        const uint8_t *raw = file.mapping + 8 + file.header_length +
-                             head_norm_byte[set];
-
-        head_norm_first[set] = cursor;
-        memcpy(skel->bss->model_bf16 + cursor, raw,
-               head_norm_elements[set] * 2);
-        cursor += head_norm_elements[set];
-    }
     if (with_attention) {
-        const uint8_t *raw = file.mapping + 8 + file.header_length + o_byte;
-
-        o_first = cursor;
-        memcpy(skel->bss->model_bf16 + cursor, raw, o_elements * 2);
-        cursor += o_elements;
-        work->o_first_bf16 = o_first;
-        post_norm_first = cursor;
-        memcpy(skel->bss->model_bf16 + cursor, post_norm_raw,
-               post_norm_elements * 2);
-        cursor += post_norm_elements;
-        work->post_norm_first_bf16 = post_norm_first;
-        for (int set = 0; set < 3; set++) {
-            const uint8_t *raw = file.mapping + 8 + file.header_length +
-                                 mlp_byte[set];
-
-            mlp_first[set] = cursor;
-            memcpy(skel->bss->model_bf16 + cursor, raw,
-                   mlp_elements[set] * 2);
-            cursor += mlp_elements[set];
-        }
+        memcpy(skel->bss->model_bf16,
+               file.mapping + 8 + file.header_length,
+               work->model_elements * 2);
+        work->embedding_first_bf16 = embedding_byte / 2;
+        for (projection = 0; projection < 3; projection++)
+            projection_first[projection] = projection_byte[projection] / 2;
+        norm_first = norm_byte / 2;
+        for (int set = 0; set < 2; set++)
+            head_norm_first[set] = head_norm_byte[set] / 2;
+        work->o_first_bf16 = o_byte / 2;
+        work->post_norm_first_bf16 = post_norm_byte / 2;
+        for (int set = 0; set < 3; set++)
+            mlp_first[set] = mlp_byte[set] / 2;
         work->gate_first_bf16 = mlp_first[0];
         work->up_first_bf16 = mlp_first[1];
         work->down_first_bf16 = mlp_first[2];
+    } else {
+        memcpy(skel->bss->model_bf16, embedding_raw, embedding_elements * 2);
+        cursor = embedding_elements;
+        for (projection = 0; projection < 3; projection++) {
+            const uint8_t *raw = file.mapping + 8 + file.header_length +
+                                 projection_byte[projection];
+
+            projection_first[projection] = cursor;
+            memcpy(skel->bss->model_bf16 + cursor, raw,
+                   projection_elements[projection] * 2);
+            cursor += projection_elements[projection];
+        }
+        norm_first = cursor;
+        memcpy(skel->bss->model_bf16 + cursor, norm_raw, norm_elements * 2);
+        cursor += norm_elements;
+        for (int set = 0; set < 2; set++) {
+            const uint8_t *raw = file.mapping + 8 + file.header_length +
+                                 head_norm_byte[set];
+
+            head_norm_first[set] = cursor;
+            memcpy(skel->bss->model_bf16 + cursor, raw,
+                   head_norm_elements[set] * 2);
+            cursor += head_norm_elements[set];
+        }
     }
     work->cols = 1024;
     work->rows = QWEN3_ARENA_BF16_ROWS;
@@ -751,6 +1110,19 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
     work->event_qkv = 1;
     work->event_rope = 1;
     work->event_attention = with_attention;
+    if (with_attention) {
+        layers[0].input_norm_first_bf16 = work->norm_first_bf16;
+        layers[0].q_first_bf16 = work->q_first_bf16;
+        layers[0].k_first_bf16 = work->k_first_bf16;
+        layers[0].v_first_bf16 = work->v_first_bf16;
+        layers[0].o_first_bf16 = work->o_first_bf16;
+        layers[0].post_norm_first_bf16 = work->post_norm_first_bf16;
+        layers[0].gate_first_bf16 = work->gate_first_bf16;
+        layers[0].up_first_bf16 = work->up_first_bf16;
+        layers[0].down_first_bf16 = work->down_first_bf16;
+        layers[0].q_norm_first_bf16 = work->q_norm_first_bf16;
+        layers[0].k_norm_first_bf16 = work->k_norm_first_bf16;
+    }
     for (col = 0; col < 1024; col++) {
         double scaled = (double)norm_weights[col] * 1048576.0;
 
@@ -940,6 +1312,39 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                 final_hidden_expected[token][row] = (int32_t)residual;
             }
         }
+    if (with_attention) {
+        layer_hidden = calloc(QWEN3_EVENT_MAX_LAYERS, sizeof(*layer_hidden));
+        layer_key = calloc(QWEN3_EVENT_MAX_LAYERS, sizeof(*layer_key));
+        layer_value = calloc(QWEN3_EVENT_MAX_LAYERS, sizeof(*layer_value));
+        if (!layer_hidden || !layer_key || !layer_value)
+            goto done;
+        memcpy(layer_hidden[0], final_hidden_expected[0],
+               sizeof(layer_hidden[0]));
+        memcpy(layer_key[0], event_expected[0] + 2048,
+               sizeof(layer_key[0]));
+        memcpy(layer_value[0], event_expected[0] + 3072,
+               sizeof(layer_value[0]));
+        memcpy(running_hidden, final_hidden_expected[0],
+               sizeof(running_hidden));
+        for (int layer = 1; layer < QWEN3_EVENT_MAX_LAYERS; layer++) {
+            if (find_layer_weights(&file, layer, &layers[layer],
+                    second_projection_byte, second_norm_q20,
+                    second_head_norm_q20, &second_o_byte,
+                    second_post_norm_q20, second_mlp_byte) ||
+                reference_one_token_layer(&file, second_projection_byte,
+                    second_norm_q20, second_head_norm_q20, second_o_byte,
+                    second_post_norm_q20, second_mlp_byte,
+                    running_hidden, next_hidden, next_key, next_value)) {
+                fprintf(stderr, "layer %d reference failed\n", layer);
+                goto done;
+            }
+            memcpy(running_hidden, next_hidden, sizeof(running_hidden));
+            memcpy(layer_hidden[layer], next_hidden, sizeof(layer_hidden[layer]));
+            memcpy(layer_key[layer], next_key, sizeof(layer_key[layer]));
+            memcpy(layer_value[layer], next_value,
+                   sizeof(layer_value[layer]));
+        }
+    }
     for (int attempt = 0; attempt < 10; attempt++) {
         struct timespec begin, end;
         __s64 elapsed_ns;
@@ -987,7 +1392,21 @@ static int run_xdp_model(struct qwen3_arena_bf16_bpf *skel,
                        with_attention ? &mlp_expected[1][0][0] : NULL,
                        with_attention ? &product_expected[0][0] : NULL,
                        with_attention ? &down_expected[0][0] : NULL);
+    if (!rc && with_attention)
+        for (uint32_t count = 2; count <= QWEN3_EVENT_MAX_LAYERS; count++) {
+            rc = run_xdp_layer_transition(skel, work, token_ids[0],
+                                          layers, count, count + 9,
+                                          event_expected[0],
+                                          layer_hidden[count - 1],
+                                          layer_key[count - 1],
+                                          layer_value[count - 1]);
+            if (rc)
+                break;
+        }
 done:
+    free(layer_hidden);
+    free(layer_key);
+    free(layer_value);
     safetensors_close(&file);
     return rc;
 }

@@ -122,10 +122,12 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
   event check also stores first-layer K/V in a kernel map and computes
   attention over consecutive token packets, followed by the output projection,
   residual addition, post-attention RMSNorm, and the complete first-layer MLP.
-  C still schedules the 28
-  layers in full inference and handles text. No full-model event path or
-  end-to-end speedup has been
-  established.
+  The event workqueue now also schedules all 28 layers using the official
+  resident weights and separate per-layer KV slots; each single-token layer
+  prefix matches an independent C fixed-point reference. Final vocabulary
+  projection, argmax, and network response are still absent from this event
+  path. C continues to schedule the separate full-inference CLI and handles
+  text. No end-to-end speedup has been established.
 - Verifier portability, broader numerical validation, and throughput remain
   research work. Do not use this on production kernels.
 

@@ -45,11 +45,15 @@ one attention step per prior position for all 16 query heads, then runs the
 resident output-projection matrix, adds it to the original hidden vector,
 applies the resident post-attention RMSNorm weights, and runs the MLP gate/up
 projections, SiLU/gating product, down projection, and second residual.
-It accepts consecutive positions in a single-session 256-position cache; a
-position-zero packet starts a new sequence. This keeps the receive hook short,
-but the remaining 27 layers and final-token result delivery are not yet
-kernel-owned. Merely changing the hook type does not provide those pieces,
-and full inference must not run inline in XDP.
+The same workqueue state machine can advance across all 28 layers using
+per-layer offsets into the resident full-model arena; KV slots include the
+layer index. The test checks every official-weight single-token layer prefix
+against independent C fixed-point arithmetic. It accepts consecutive
+positions in a single-session 256-position cache; a position-zero packet starts
+a new sequence. Multi-token correctness across all 28 layers, final vocabulary
+projection/argmax, and network result delivery remain unverified or absent in
+the event path. The receive hook only queues work; full inference does not run
+inline in XDP.
 
 | Kernel program | Role in full inference |
 | --- | --- |

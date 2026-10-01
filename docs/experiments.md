@@ -187,6 +187,17 @@ container in this run. It is not a full-model result or a matched user-space
 comparison; the remaining 27 layers, vocabulary argmax, and network return
 path are not implemented in the event scheduler.
 
+The next state-machine increment added resident per-layer tensor offsets and
+layer-indexed KV slots. A packet at position zero now drives 28 consecutive
+decoder layers without user-space operator scheduling. The official BF16 model
+payload is preloaded into the BPF arena by the test loader. Each 2–28-layer
+prefix matched an independent C fixed-point reference for its final 1,024
+hidden values and last-layer K/V; layer zero and last-layer cache slots were
+checked separately. The reference initially contained an unsigned/signed
+multiplication error, exposed at layer four, and passed only after that error
+was corrected. This does not yet establish multi-token full-model correctness,
+vocabulary argmax, a network reply, or a matched performance benefit.
+
 First measured run (2026-09-24): Linux 6.17.0 arm64, Ubuntu 24.04 build
 container, BPF program accepted by the kernel verifier. The synthetic row
 returned `-1345`. For the official layer-0 Q-projection row, Q8 gave

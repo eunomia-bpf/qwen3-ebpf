@@ -38,7 +38,7 @@ help:
 	  'make test-arena-bf16 [MODEL=...] Run optional arena BF16 checks' \
 	  'make test-arena-xdp   Live XDP/workqueue smoke test on this network namespace loopback' \
 	  'make test-arena-xdp-model MODEL=... Run token-driven real-weight XDP matrix check' \
-	  'make test-arena-xdp-attention MODEL=... Run two-token XDP attention and KV-cache check' \
+	  'make test-arena-xdp-attention MODEL=... Check two-token attention and 28-layer XDP prefix' \
 	  'make test-arena-int4 [MODEL=...] Run optional arena INT4 checks' \
 	  'make clean           Remove build outputs'
 

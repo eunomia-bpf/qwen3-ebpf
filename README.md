@@ -3,7 +3,8 @@
 **Run Qwen3-0.6B model arithmetic inside the Linux kernel.**
 
 [Quick start](#quick-start) · [Architecture](docs/architecture.md) ·
-[Usage & tests](docs/usage.md) · [Experiments](docs/experiments.md) · [MIT license](LICENSE)
+[Usage & tests](docs/usage.md) · [Experiments](docs/experiments.md) ·
+[Paper](paper/bpfllm.pdf) · [MIT license](LICENSE)
 
 An experimental C/libbpf implementation of Qwen3-0.6B forward computation in
 Linux eBPF. It runs **all 28 decoder layers**, maintains a kernel KV cache,
@@ -129,6 +130,14 @@ operator experiments are documented in [Usage & tests](docs/usage.md).
 
 Detailed results, model/tokenizer hashes, comparisons, and unsuccessful
 experiments are preserved in [Experiments](docs/experiments.md).
+
+## Paper and write-ups
+
+- [Can eBPF Run a Real Language Model? Lessons from a Kernel-Resident Qwen3
+  Forward Pass](paper/bpfllm.pdf): a four-page report that calls the system
+  bpfllm. Its LaTeX source and build notes are in [paper/](paper/).
+- Blog: [English](https://eunomia.dev/blog/2026/09/24/qwen3-ebpf-in-kernel-inference/)
+  · [中文](https://eunomia.dev/zh/blog/2026/09/24/qwen3-ebpf-in-kernel-inference/)
 
 ## License
 
